@@ -75,6 +75,11 @@ namespace webmanager
 
         httpd_handle_t http_server{nullptr};
         int websocket_file_descriptor{-1};
+        std::string auth_username{""};
+        std::string auth_password{""};
+        std::string session_token{""};
+        time_t session_expiry_us{0};
+        const time_t SESSION_TIMEOUT_US = 3600000000; // 1 hour in microseconds
 
         // Das ist der Status, der alles beschreiben muss
         WorkingState workingState{WorkingState::AP_STARTED};
@@ -404,7 +409,17 @@ namespace webmanager
         {
             if (req->method == HTTP_GET)
             {
-                ESP_LOGI(TAG, "Handshake done, the new websocket connection was opened");
+                // Validate session token on WebSocket handshake
+                char cookie_buf[256] = {0};
+                if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) != ESP_OK ||
+                    !validate_session_token(cookie_buf))
+                {
+                    ESP_LOGW(TAG, "WebSocket: No valid session token");
+                    httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+                    return ESP_FAIL;
+                }
+                
+                ESP_LOGI(TAG, "WebSocket connection authenticated and opened");
                 return ESP_OK;
             }
 
@@ -862,6 +877,213 @@ namespace webmanager
             return ESP_OK;
         }
 
+        bool validate_credentials(const char *username, const char *password)
+        {
+            if (!username || !password) return false;
+            return (auth_username == username) && (auth_password == password);
+        }
+
+        std::string generate_random_token()
+        {
+            char token[33];
+            uint8_t random_bytes[16];
+            esp_fill_random(random_bytes, sizeof(random_bytes));
+            
+            for (int i = 0; i < 16; i++) {
+                snprintf(&token[i*2], 3, "%02x", random_bytes[i]);
+            }
+            token[32] = '\0';
+            return std::string(token);
+        }
+
+        bool create_session(const char *username)
+        {
+            xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
+            session_token = generate_random_token();
+            session_expiry_us = esp_timer_get_time() + SESSION_TIMEOUT_US;
+            xSemaphoreGive(webmanager_semaphore);
+            ESP_LOGI(TAG, "Session created for user '%s', token expires in 1 hour", username);
+            return true;
+        }
+
+        bool validate_session_token(const char *cookie_header)
+        {
+            if (!cookie_header) return false;
+            
+            char token_buf[33] = {0};
+            const char *session_cookie = strstr(cookie_header, "session=");
+            if (!session_cookie) return false;
+            
+            session_cookie += 8; // strlen("session=")
+            sscanf(session_cookie, "%32s", token_buf);
+            
+            xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
+            time_t now = esp_timer_get_time();
+            bool valid = (!session_token.empty() && 
+                         session_token == token_buf && 
+                         now < session_expiry_us);
+            xSemaphoreGive(webmanager_semaphore);
+            
+            return valid;
+        }
+
+        void invalidate_session()
+        {
+            xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
+            session_token.clear();
+            session_expiry_us = 0;
+            xSemaphoreGive(webmanager_semaphore);
+            ESP_LOGI(TAG, "Session invalidated");
+        }
+
+        esp_err_t handle_login_form(httpd_req_t *req)
+        {
+            const char *html = 
+                "<!DOCTYPE html>"
+                "<html lang='de'>"
+                "<head>"
+                "<meta charset='UTF-8'>"
+                "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+                "<title>Webmanager Login</title>"
+                "<link href='https://fonts.googleapis.com/css?family=Dosis:400,700' rel='stylesheet'>"
+                "<style>"
+                ":root { --blue-rich: #0066cc; --blue-4: hsl(211, 39%, 44%); --main-white: #f2f2f2; }"
+                "*{margin:0;padding:0;box-sizing:border-box;}"
+                "body { font-family: 'Dosis', sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: linear-gradient(135deg, var(--blue-4) 0%, var(--blue-rich) 100%); padding: 20px; }"
+                ".login-container { background: var(--main-white); padding: 3rem 2rem; border-radius: 8px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); width: 100%; max-width: 420px; }"
+                "h1 { text-align: center; color: var(--blue-rich); margin-bottom: 2rem; font-size: 28px; font-weight: 700; }"
+                ".form-group { margin-bottom: 1.5rem; }"
+                "label { display: block; margin-bottom: 0.6rem; color: #333; font-weight: 500; font-size: 14px; }"
+                "input[type='text'], input[type='password'] { width: 100%; padding: 0.75rem 1rem; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; font-family: 'Dosis', sans-serif; transition: border-color 0.2s ease-out, box-shadow 0.2s ease-out; }"
+                "input[type='text']:focus, input[type='password']:focus { outline: none; border-color: var(--blue-rich); box-shadow: 0 0 5px rgba(0, 102, 204, 0.3); }"
+                "button { width: 100%; padding: 0.75rem; background: var(--blue-rich); color: white; border: none; border-radius: 4px; font-size: 14px; font-weight: 700; font-family: 'Dosis', sans-serif; cursor: pointer; transition: background-color 0.2s ease-out, transform 0.1s ease-out; }"
+                "button:hover { background: var(--blue-4); }"
+                "button:active { transform: scale(0.98); }"
+                ".error { color: #dc3545; text-align: center; margin-bottom: 1rem; font-weight: 500; }"
+                "@media (max-width: 480px) { .login-container { padding: 2rem 1.5rem; } h1 { font-size: 24px; } input { font-size: 16px; } }"
+                "</style>"
+                "</head>"
+                "<body>"
+                "<div class='login-container'>"
+                "<h1>Webmanager Login</h1>"
+                "<form method='POST' action='/login'>"
+                "<div class='form-group'>"
+                "<label for='username'>Benutzername:</label>"
+                "<input type='text' id='username' name='username' required autofocus>"
+                "</div>"
+                "<div class='form-group'>"
+                "<label for='password'>Kennwort:</label>"
+                "<input type='password' id='password' name='password' required>"
+                "</div>"
+                "<button type='submit'>Anmelden</button>"
+                "</form>"
+                "</div>"
+                "</body>"
+                "</html>";
+            
+            httpd_resp_set_type(req, "text/html; charset=utf-8");
+            httpd_resp_sendstr(req, html);
+            return ESP_OK;
+        }
+
+        esp_err_t handle_login_post(httpd_req_t *req)
+        {
+            char buf[256] = {0};
+            size_t recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+            if (recv_len <= 0) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request");
+                return ESP_FAIL;
+            }
+
+            char username[64] = {0};
+            char password[64] = {0};
+
+            // Parse form data: username=...&password=...
+            char *user_ptr = strstr(buf, "username=");
+            char *pass_ptr = strstr(buf, "password=");
+
+            if (!user_ptr || !pass_ptr) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing credentials");
+                return ESP_FAIL;
+            }
+
+            user_ptr += 9; // strlen("username=")
+            pass_ptr += 9; // strlen("password=")
+
+            sscanf(user_ptr, "%63[^&]", username);
+            sscanf(pass_ptr, "%63[^&]", password);
+
+            // Validate credentials
+            if (validate_credentials(username, password)) {
+                ESP_LOGI(TAG, "Login successful for user '%s'", username);
+                create_session(username);
+                
+                // Set cookie with session token
+                char cookie_header[256];
+                snprintf(cookie_header, sizeof(cookie_header), 
+                    "Set-Cookie: session=%s; Path=/; HttpOnly; SameSite=Strict\r\n"
+                    "Set-Cookie: username=%s; Path=/; SameSite=Strict", 
+                    session_token.c_str(), username);
+                httpd_resp_set_hdr(req, "Set-Cookie", cookie_header);
+                httpd_resp_set_status(req, "303 See Other");
+                httpd_resp_set_hdr(req, "Location", "/");
+                httpd_resp_sendstr(req, "");
+                return ESP_OK;
+            }
+
+            ESP_LOGW(TAG, "Login failed for user '%s'", username);
+            httpd_resp_set_type(req, "text/html; charset=utf-8");
+            httpd_resp_sendstr(req, 
+                "<!DOCTYPE html>"
+                "<html lang='de'>"
+                "<head>"
+                "<meta charset='UTF-8'>"
+                "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+                "<link href='https://fonts.googleapis.com/css?family=Dosis:400,700' rel='stylesheet'>"
+                "<style>"
+                ":root { --blue-rich: #0066cc; --blue-4: hsl(211, 39%, 44%); --main-white: #f2f2f2; }"
+                "*{margin:0;padding:0;box-sizing:border-box;}"
+                "body { font-family: 'Dosis', sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: linear-gradient(135deg, var(--blue-4) 0%, var(--blue-rich) 100%); padding: 20px; }"
+                ".error-container { background: var(--main-white); padding: 3rem 2rem; border-radius: 8px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); width: 100%; max-width: 420px; text-align: center; }"
+                "h2 { color: #dc3545; margin-bottom: 1rem; font-size: 24px; font-weight: 700; }"
+                "p { color: #666; margin-bottom: 2rem; font-size: 14px; }"
+                "a { text-decoration: none; }"
+                "button { padding: 0.75rem 2rem; background: var(--blue-rich); color: white; border: none; border-radius: 4px; font-size: 14px; font-weight: 700; font-family: 'Dosis', sans-serif; cursor: pointer; transition: background-color 0.2s ease-out; }"
+                "button:hover { background: var(--blue-4); }"
+                "</style>"
+                "</head>"
+                "<body>"
+                "<div class='error-container'>"
+                "<h2>Authentifizierung fehlgeschlagen</h2>"
+                "<p>Benutzername oder Kennwort ist ungültig.</p>"
+                "<a href='/'><button>Zurück zum Login</button></a>"
+                "</div>"
+                "</body>"
+                "</html>");
+            return ESP_OK;
+        }
+
+        esp_err_t handle_webmanager_get(httpd_req_t *req)
+        {
+            // Check for valid session cookie
+            char cookie_buf[256] = {0};
+            if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK)
+            {
+                if (validate_session_token(cookie_buf))
+                {
+                    ESP_LOGI(TAG, "User authenticated via session token");
+                    httpd_resp_set_type(req, "text/html");
+                    httpd_resp_set_hdr(req, "Content-Encoding", "br");
+                    httpd_resp_send(req, webmanager_html_br_start, webmanager_html_br_length);
+                    return ESP_OK;
+                }
+            }
+            
+            // No valid session: show login form
+            ESP_LOGI(TAG, "Showing login form (no valid session)");
+            return handle_login_form(req);
+        }
+
     public:
         static M *GetSingleton()
         {
@@ -948,21 +1170,26 @@ namespace webmanager
                 { return static_cast<M *>(req->user_ctx)->handle_ota_post(req); },
                 this, false, false, nullptr};
             ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &ota_post));
+            
+            httpd_uri_t login_post = {
+                "/login",
+                HTTP_POST,
+                [](httpd_req_t *req)
+                { return static_cast<M *>(req->user_ctx)->handle_login_post(req); },
+                this, false, false, nullptr};
+            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &login_post));
+            
             httpd_uri_t webmanager_ws = {
                 "/webmanager_ws",
                 HTTP_GET,
                 [](httpd_req_t *req)
                 { return static_cast<webmanager::M *>(req->user_ctx)->handle_webmanager_ws(req); }, this, true, false, nullptr};
             ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &webmanager_ws));
+            
             httpd_uri_t webmanager_get = {
                 "/*", HTTP_GET,
                 [](httpd_req_t *req)
-                {
-                    httpd_resp_set_type(req, "text/html");
-                    httpd_resp_set_hdr(req, "Content-Encoding", "br");
-                    httpd_resp_send(req, webmanager_html_br_start, webmanager_html_br_length);
-                    return ESP_OK;
-                },
+                { return static_cast<M *>(req->user_ctx)->handle_webmanager_get(req); },
                 this, false, false, nullptr};
             ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &webmanager_get));
             this->http_server = httpd_handle;
@@ -970,11 +1197,13 @@ namespace webmanager
 
 
 
-        esp_err_t Begin(const char *accessPointSsid, const char *accessPointPassword, const char *hostname, bool resetStoredWifiConnection, std::vector<iWebmanagerPlugin *> *plugins, bool init_netif_and_create_event_loop = true, bool startOwnSupervisorTask=true, esp_log_level_t wifiLogLevel=ESP_LOG_WARN)
+        esp_err_t Begin(const char *accessPointSsid, const char *accessPointPassword, const char *hostname, bool resetStoredWifiConnection, std::vector<iWebmanagerPlugin *> *plugins, bool init_netif_and_create_event_loop = true, bool startOwnSupervisorTask=true, esp_log_level_t wifiLogLevel=ESP_LOG_WARN, const char *auth_username_param="admin", const char *auth_password_param="password")
         {
             ESP_LOGI(TAG, "Stating Webmanager");
             
             this->hostname=hostname;
+            this->auth_username=auth_username_param;
+            this->auth_password=auth_password_param;
             
             if (strlen(accessPointPassword) < 8 && AP_AUTHMODE != WIFI_AUTH_OPEN){
                 ESP_LOGE(TAG, "Password too short for authentication. Minimal length is 8. Exiting Webmanager");
