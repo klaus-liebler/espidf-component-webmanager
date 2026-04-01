@@ -245,9 +245,17 @@ namespace webmanager
             size_t sz;
             GOTO_ERROR_ON_ERROR(nvs_open_from_partition(NVS_PARTITION, WIFI_NVS_NAMESPACE, NVS_READWRITE, &handle), "Unable to open nvs partition '%s' and namespace '%s' ", NVS_PARTITION, WIFI_NVS_NAMESPACE);
             sz = sizeof(wifi_config_sta.sta.ssid);
-            GOTO_ERROR_ON_ERROR(nvs_get_str(handle, nvs_key_wifi_ssid, (char *)wifi_config_sta.sta.ssid, &sz), "Unable to read Wifi SSID from NVS");
+            if(ESP_OK != nvs_get_str(handle, nvs_key_wifi_ssid, (char *)wifi_config_sta.sta.ssid, &sz)){
+                //no error message here, because it can be normal that there is no config in the flash. In this case, we just want to fallback to the AccessPoint mode
+                ret=ESP_FAIL;
+                goto error;
+            }
             sz = sizeof(wifi_config_sta.sta.password);
-            GOTO_ERROR_ON_ERROR(nvs_get_str(handle, nvs_key_wifi_password, (char *)wifi_config_sta.sta.password, &sz), "Unable to read Wifi password from NVS");
+            if(ESP_OK != nvs_get_str(handle, nvs_key_wifi_password, (char *)wifi_config_sta.sta.password, &sz)){
+                //no error message here, because it can be normal that there is no config in the flash. In this case, we just want to fallback to the AccessPoint mode
+                ret=ESP_FAIL;
+                goto error;
+            }
             ESP_LOGI(TAG, "Successfully read Wifi credentials {'ssid':'%s', 'password':'%s'}", wifi_config_sta.sta.ssid, wifi_config_sta.sta.password);
             ret = (wifi_config_sta.sta.ssid[0] == '\0') ? ESP_FAIL : ESP_OK;
         error:
@@ -334,8 +342,8 @@ namespace webmanager
             time_t now_us = esp_timer_get_time();
             switch (event_id)
             {
-            case IP_EVENT_AP_STAIPASSIGNED:{
-                const ip_event_ap_staipassigned_t *ip = (ip_event_ap_staipassigned_t *)event_data;
+            case IP_EVENT_ASSIGNED_IP_TO_CLIENT:{
+                const ip_event_assigned_ip_to_client_t *ip = (ip_event_assigned_ip_to_client_t *)event_data;
                 ESP_LOGI(TAG, "Connected Wifi Station got IP from DHCP {'ip':'" IPSTR "'}", IP2STR(&ip->ip));
                 break;
             }
@@ -398,8 +406,17 @@ namespace webmanager
             if (myself->http_server && myself->websocket_file_descriptor != -1)
             {
                 httpd_ws_frame_t ws_pkt = {false, false, HTTPD_WS_TYPE_BINARY, a->buffer, a->buffer_len};
-                httpd_ws_send_frame_async(myself->http_server, myself->websocket_file_descriptor, &ws_pkt);
-                ESP_LOGD(TAG, "httpd_ws_send_frame_async: data_len:%u\n", ws_pkt.len);
+                esp_err_t ret = httpd_ws_send_frame_async(myself->http_server, myself->websocket_file_descriptor, &ws_pkt);
+                if (ret == ESP_OK)
+                {
+                    ESP_LOGD(TAG, "httpd_ws_send_frame_async: data_len:%u\n", ws_pkt.len);
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "httpd_ws_send_frame_async failed (0x%x). Invalidating websocket session fd %d", (unsigned int)ret, myself->websocket_file_descriptor);
+                    httpd_sess_trigger_close(myself->http_server, myself->websocket_file_descriptor);
+                    myself->websocket_file_descriptor = -1;
+                }
                 // should be syncronous. So the buffer can be deleted, when the function returns
             }
             delete a;
@@ -1129,12 +1146,19 @@ namespace webmanager
         {
             if (!http_server)
                 return ESP_FAIL;
+            if (websocket_file_descriptor == -1)
+                return ESP_ERR_INVALID_STATE;
             auto *a = new AsyncResponse(ns, &b);
-            if (httpd_queue_work(http_server, M::ws_async_send, a) != ESP_OK)
+            esp_err_t ret = httpd_queue_work(http_server, M::ws_async_send, a);
+            if (ret != ESP_OK)
             {
                 delete (a);
+                if (ret == ESP_ERR_INVALID_ARG || ret == ESP_FAIL)
+                {
+                    websocket_file_descriptor = -1;
+                }
             }
-            return ESP_OK;
+            return ret;
         }
 
         void RegisterHTTPDHandlers(httpd_handle_t httpd_handle)
