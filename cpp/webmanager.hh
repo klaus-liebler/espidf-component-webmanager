@@ -422,6 +422,31 @@ namespace webmanager
             delete a;
         }
 
+        void close_active_websocket_before_ap_shutdown()
+        {
+            if (!http_server || websocket_file_descriptor == -1)
+            {
+                return;
+            }
+
+            const int ws_fd = websocket_file_descriptor;
+
+            if (httpd_ws_get_fd_info(http_server, ws_fd) == HTTPD_WS_CLIENT_WEBSOCKET)
+            {
+                uint8_t close_payload[2] = {0x03, 0xE8}; // 1000 = normal closure
+                httpd_ws_frame_t close_pkt = {false, false, HTTPD_WS_TYPE_CLOSE, close_payload, sizeof(close_payload)};
+                esp_err_t send_ret = httpd_ws_send_frame_async(http_server, ws_fd, &close_pkt);
+                if (send_ret != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "Failed to send websocket close frame to fd %d (%d)", ws_fd, send_ret);
+                }
+            }
+
+            httpd_sess_trigger_close(http_server, ws_fd);
+            websocket_file_descriptor = -1;
+            ESP_LOGI(TAG, "Closed active websocket session fd %d before AP shutdown", ws_fd);
+        }
+
         esp_err_t handle_webmanager_ws(httpd_req_t *req)
         {
             if (req->method == HTTP_GET)
@@ -450,7 +475,19 @@ namespace webmanager
             this->websocket_file_descriptor = httpd_req_to_sockfd(req);
 
             /* Set max_len = 0 to get the frame len */
-            ESP_ERROR_CHECK(httpd_ws_recv_frame(req, &ws_pkt, 0));
+            esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
+            if (ret != ESP_OK)
+            {
+                // Bad/malformed websocket frames can happen during disconnect/AP transitions.
+                // Never abort the device from this callback.
+                if (ret == ESP_ERR_INVALID_STATE)
+                {
+                    ESP_LOGW(TAG, "Ignoring websocket frame in invalid state (%d)", ret);
+                    return ESP_OK;
+                }
+                ESP_LOGW(TAG, "httpd_ws_recv_frame(header) failed with %d", ret);
+                return ret;
+            }
             if (ws_pkt.len == 0 || ws_pkt.type != HTTPD_WS_TYPE_BINARY)
             {
                 ESP_LOGE(TAG, "Received an empty or an non binary websocket frame");
@@ -459,13 +496,19 @@ namespace webmanager
             uint8_t *buf = new uint8_t[ws_pkt.len];
             assert(buf);
             ws_pkt.payload = buf;
-            esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
+            ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
 
             if (ret != ESP_OK)
             {
                 ESP_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
                 delete[] buf;
                 return ret;
+            }
+            if (ws_pkt.len < 4)
+            {
+                ESP_LOGW(TAG, "Ignoring short websocket binary frame (len=%u)", (unsigned)ws_pkt.len);
+                delete[] buf;
+                return ESP_OK;
             }
             uint32_t ns = *((uint32_t *)buf);
             uint8_t *fb_buf = buf + 4;
@@ -1371,6 +1414,7 @@ namespace webmanager
                 wifi_mode_t mode;
                 esp_wifi_get_mode(&mode);
                 if(mode!=WIFI_MODE_STA){
+                    close_active_websocket_before_ap_shutdown();
                     esp_wifi_set_mode(WIFI_MODE_STA);
                     ESP_LOGI("WMSV", "Switching off AccessPoint");
                 }else{
