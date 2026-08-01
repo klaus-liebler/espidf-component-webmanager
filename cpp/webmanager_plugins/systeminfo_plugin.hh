@@ -1,8 +1,7 @@
 #pragma once
 
 #include "webmanager_interfaces.hh"
-#include "flatbuffers/flatbuffers.h"
-#include "flatbuffers_cpp/ns02systeminfo_generated.h"
+#include "wsprotocol_cpp/ws_protocol.hh"
 #include <driver/temperature_sensor.h>
 #define TAG "SYSINFO"
 
@@ -11,13 +10,25 @@ class SystemInfoPlugin : public webmanager::iWebmanagerPlugin
 private:
     temperature_sensor_handle_t tempHandle{nullptr};
 
-    esp_err_t sendResponseSystemData(webmanager::iWebmanagerCallback *callback)
+    static WsProtocol::systeminfo::Mac6 ReadMac(esp_mac_type_t type)
+    {
+        WsProtocol::systeminfo::Mac6 mac{};
+        esp_read_mac(mac.v, type);
+        return mac;
+    }
+
+    webmanager::eMessageReceiverResult sendResponseSystemData(webmanager::iWebmanagerCallback *callback, uint16_t requestId)
     {
         ESP_LOGI(TAG, "Prepare to send ResponseSystemData");
-        flatbuffers::FlatBufferBuilder b(1024);
         const esp_partition_t *running = esp_ota_get_running_partition();
         esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, nullptr);
-        std::vector<flatbuffers::Offset<systeminfo::PartitionInfo>> partitions_vector;
+
+        // Grosszuegig bemessen: bis zu 20 Partitionen, je [classId:u16][label+appName+appVersion+
+        // appDate+appTime (je <=32+null)][type,subtype,otaState,running:4 Byte][size:u32].
+        static uint8_t partitions_scratch[20 * 192];
+        size_t partitions_pos = 0;
+        size_t partitions_count = 0;
+
         while (it)
         {
             const esp_partition_t *p = esp_partition_get(it);
@@ -25,13 +36,35 @@ private:
             esp_ota_get_state_partition(p, &ota_state);
             esp_app_desc_t app_info = {};
             esp_ota_get_partition_description(p, &app_info);
-            if (p->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MIN && p->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MAX && !(ota_state == ESP_OTA_IMG_NEW || ota_state == ESP_OTA_IMG_PENDING_VERIFY || ota_state == ESP_OTA_IMG_VALID || ota_state == ESP_OTA_IMG_INVALID || ota_state == ESP_OTA_IMG_ABORTED))
+
+            WsProtocol::systeminfo::PartitionInfo::Payload item{};
+            item.label = p->label;
+            item.type = (uint8_t)p->type;
+            item.subtype = (uint8_t)p->subtype;
+            item.size = p->size;
+            item.otaState = (int8_t)ota_state;
+            item.running = (p == running);
+            bool isUnpopulatedAppPartition = p->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MIN && p->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MAX && !(ota_state == ESP_OTA_IMG_NEW || ota_state == ESP_OTA_IMG_PENDING_VERIFY || ota_state == ESP_OTA_IMG_VALID || ota_state == ESP_OTA_IMG_INVALID || ota_state == ESP_OTA_IMG_ABORTED);
+            if (isUnpopulatedAppPartition)
             {
-                partitions_vector.push_back(systeminfo::CreatePartitionInfoDirect(b, p->label, (uint8_t)p->type, (uint8_t)p->subtype, p->size, (uint8_t)ota_state, p == running, "", "", "", ""));
+                item.appName = "";
+                item.appVersion = "";
+                item.appDate = "";
+                item.appTime = "";
             }
             else
             {
-                partitions_vector.push_back(systeminfo::CreatePartitionInfoDirect(b, p->label, (uint8_t)p->type, (uint8_t)p->subtype, p->size, (uint8_t)ota_state, p == running, app_info.project_name, app_info.version, app_info.date, app_info.time));
+                item.appName = app_info.project_name;
+                item.appVersion = app_info.version;
+                item.appDate = app_info.date;
+                item.appTime = app_info.time;
+            }
+
+            size_t newPos = WsProtocol::systeminfo::AppendResponseSystemDataPartitionsPartitionInfoElement(item, partitions_scratch, partitions_pos, sizeof(partitions_scratch));
+            if (newPos > 0)
+            {
+                partitions_pos = newPos;
+                partitions_count++;
             }
             it = esp_partition_next(it);
         }
@@ -45,44 +78,33 @@ private:
         if(tempHandle){
             ESP_ERROR_CHECK(temperature_sensor_get_celsius(tempHandle, &tsens_out));
         }
-        uint8_t mac_buffer[6];
-        esp_read_mac(mac_buffer, ESP_MAC_BT);
-        auto bt = systeminfo::Mac6(mac_buffer);
-        esp_read_mac(mac_buffer, ESP_MAC_ETH);
-        auto eth = systeminfo::Mac6(mac_buffer);
+
+        WsProtocol::systeminfo::ResponseSystemData::Payload resp{};
+        resp.requestId = requestId;
+        resp.secondsEpoch = tv_now.tv_sec;
+        resp.secondsUptime = esp_timer_get_time() / 1000000;
+        resp.freeHeap = esp_get_free_heap_size();
+        resp.macAddressWifiSta = ReadMac(ESP_MAC_WIFI_STA);
+        resp.macAddressWifiSoftap = ReadMac(ESP_MAC_WIFI_SOFTAP);
+        resp.macAddressBt = ReadMac(ESP_MAC_BT);
+        resp.macAddressEth = ReadMac(ESP_MAC_ETH);
 #if CONFIG_SOC_IEEE802154_SUPPORTED
-        esp_read_mac(mac_buffer, ESP_MAC_IEEE802154);
+        resp.macAddressIeee802154 = ReadMac(ESP_MAC_IEEE802154);
 #else
-        for (int i = 0; i < 6; i++)
-            mac_buffer[i] = 0;
+        resp.macAddressIeee802154 = {};
 #endif
-        auto ieee = systeminfo::Mac6(mac_buffer);
-        esp_read_mac(mac_buffer, ESP_MAC_WIFI_SOFTAP);
-        auto softap = systeminfo::Mac6(mac_buffer);
-        esp_read_mac(mac_buffer, ESP_MAC_WIFI_STA);
-        auto sta = systeminfo::Mac6(mac_buffer);
-        b.Finish(
-            systeminfo::CreateResponseWrapper(
-                b,
-                systeminfo::Responses::Responses_ResponseSystemData,
-                systeminfo::CreateResponseSystemDataDirect(
-                    b,
-                    tv_now.tv_sec,
-                    esp_timer_get_time() / 1000000,
-                    esp_get_free_heap_size(),
-                    &sta,
-                    &softap,
-                    &bt,
-                    &eth,
-                    &ieee,
-                    (uint32_t)chip_info.model,
-                    chip_info.features,
-                    chip_info.revision,
-                    chip_info.cores,
-                    tsens_out,
-                    &partitions_vector)
-                    .Union()));
-        return callback->WrapAndSendAsync(systeminfo::Namespace::Namespace_Value, b);
+        resp.chipModel = (uint32_t)chip_info.model;
+        resp.chipFeatures = chip_info.features;
+        resp.chipRevision = chip_info.revision;
+        resp.chipCores = chip_info.cores;
+        resp.chipTemperature = tsens_out;
+        resp.partitionsData = partitions_scratch;
+        resp.partitionsCount = partitions_count;
+        resp.partitionsDataSize = partitions_pos;
+
+        static uint8_t buf[4096];
+        size_t len = WsProtocol::systeminfo::ResponseSystemData::Encode(resp, buf, sizeof(buf));
+        return (len > 0 && callback->SendRawAsync(buf, len) == ESP_OK) ? webmanager::eMessageReceiverResult::OK : webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
     }
 
 public:
@@ -98,25 +120,25 @@ public:
     void OnWifiConnect(webmanager::iWebmanagerCallback *callback) override { (void)(callback); }
     void OnWifiDisconnect(webmanager::iWebmanagerCallback *callback) override { (void)(callback); }
     void OnTimeUpdate(webmanager::iWebmanagerCallback *callback) override { (void)(callback); }
-    webmanager::eMessageReceiverResult ProvideWebsocketMessage(webmanager::iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint32_t ns, uint8_t *buf) override
+    webmanager::eMessageReceiverResult ProvideWebsocketMessage(webmanager::iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint16_t namespaceId, uint16_t messageTypeId, const uint8_t *frame, size_t frameLen) override
     {
-        if (ns != systeminfo::Namespace::Namespace_Value)
+        if (namespaceId != WsProtocol::systeminfo::NAMESPACE_ID)
             return webmanager::eMessageReceiverResult::NOT_FOR_ME;
-        auto rw = flatbuffers::GetRoot<systeminfo::RequestWrapper>(buf);
-        auto reqType = rw->request_type();
 
-        switch (reqType)
+        switch (messageTypeId)
         {
-        case systeminfo::Requests::Requests_RequestRestart:
+        case WsProtocol::systeminfo::RequestRestart::TYPE_ID:
         {
             esp_restart();
             return webmanager::eMessageReceiverResult::OK;
         }
 
-        case systeminfo::Requests::Requests_RequestSystemData:
+        case WsProtocol::systeminfo::RequestSystemData::TYPE_ID:
         {
-            sendResponseSystemData(callback);
-            return webmanager::eMessageReceiverResult::OK;
+            WsProtocol::systeminfo::RequestSystemData::Payload req{};
+            if (!WsProtocol::systeminfo::RequestSystemData::Decode(frame, frameLen, req))
+                return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            return sendResponseSystemData(callback, req.requestId);
         }
         default:
             return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;

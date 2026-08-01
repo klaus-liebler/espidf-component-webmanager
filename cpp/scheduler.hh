@@ -12,7 +12,7 @@
 #include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "nvs.h"
-#include <flatbuffers/flatbuffers.h>
+#include "wsprotocol_cpp/ws_protocol.hh"
 #include "sdkconfig.h"
 #include <common.hh>
 #include "interfaces.hh"
@@ -80,9 +80,13 @@ namespace scheduler
                 nvs_get_blob(this->nvsSchedulerHandle, info.key, nullptr, &length);
                 uint8_t data[length];
                 nvs_get_blob(this->nvsSchedulerHandle, info.key, data, &length);
-                const scheduler::Schedule *fbSched = flatbuffers::GetRoot<scheduler::Schedule>(data);
-                aTimer *t = Builder::BuildFromFlatbuffer(fbSched);
-                this->name2timer[t->GetName()] = t;
+                WsProtocol::scheduler::Schedule::Payload schedule{};
+                size_t pos = 0;
+                if (WsProtocol::scheduler::Schedule::Decode(data, length, pos, schedule))
+                {
+                    aTimer *t = Builder::BuildFromSchedule(schedule);
+                    if (t) this->name2timer[t->GetName()] = t;
+                }
                 res = nvs_entry_next(&it);
             }
             nvs_release_iterator(it);
@@ -108,145 +112,169 @@ namespace scheduler
             return ESP_OK;
         }
 
-        esp_err_t handleRequest(webmanager::iWebmanagerCallback *callback, flatbuffers::FlatBufferBuilder &b, const scheduler::RequestSchedulerOpen *req)
+        webmanager::eMessageReceiverResult handleRequestOpen(webmanager::iWebmanagerCallback *callback, const WsProtocol::scheduler::RequestSchedulerOpen::Payload &req)
         {
-            auto c_name = req->name()->c_str();
-            auto s_name = req->name()->str();
-            if (!this->name2timer.contains(s_name))
+            if (!this->name2timer.contains(req.name))
             {
-                ESP_LOGW(TAG, "Did not found scheduler '%s' in local database", c_name);
-                return ESP_FAIL;
+                ESP_LOGW(TAG, "Did not found scheduler '%s' in local database", req.name);
+                return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
             }
-            ESP_LOGI(TAG, "Send uResponseScheduler_ResponseSchedulerOpen for '%s' back to browser", c_name);
-            scheduler::aTimer *o = this->name2timer.at(s_name);
+            ESP_LOGI(TAG, "Send ResponseSchedulerOpen for '%s' back to browser", req.name);
+            scheduler::aTimer *o = this->name2timer.at(req.name);
 
+            uint8_t variant_scratch[128];
+            size_t variantLen = o->EncodeScheduleVariant(variant_scratch, 0, sizeof(variant_scratch));
+            WsProtocol::scheduler::Schedule::Payload schedule{};
+            schedule.name = req.name;
+            schedule.scheduleData = variant_scratch;
+            schedule.scheduleDataSize = variantLen;
 
-            b.Finish(
-                scheduler::CreateResponseWrapper(
-                    b,
-                    scheduler::Responses::Responses_ResponseSchedulerOpen,
-                    scheduler::CreateResponseSchedulerOpen(b, o->CreateFlatbufferScheduleOffset(b)).Union()
-                )
-            );
-            return callback->WrapAndSendAsync(scheduler::Namespace::Namespace_Value, b);
+            uint8_t payload_scratch[160];
+            size_t payloadLen = WsProtocol::scheduler::AppendResponseSchedulerOpenPayloadScheduleElement(schedule, payload_scratch, 0, sizeof(payload_scratch));
+
+            WsProtocol::scheduler::ResponseSchedulerOpen::Payload resp{};
+            resp.requestId = req.requestId;
+            resp.payloadData = payload_scratch;
+            resp.payloadDataSize = payloadLen;
+
+            uint8_t buf[256];
+            size_t len = WsProtocol::scheduler::ResponseSchedulerOpen::Encode(resp, buf, sizeof(buf));
+            return (len > 0 && callback->SendRawAsync(buf, len) == ESP_OK) ? webmanager::eMessageReceiverResult::OK : webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
         }
 
-        void FillFlatbufferWithAvailableNames(flatbuffers::FlatBufferBuilder &b, std::vector<flatbuffers::Offset<flatbuffers::String>> &vect) override
+        void FillAvailableScheduleNames(std::vector<std::string> &names) override
         {
             for (auto const &[key, val] : name2timer)
             {
-                vect.push_back(b.CreateString(key));
+                names.push_back(key);
             }
         }
 
-        esp_err_t handleRequestList(webmanager::iWebmanagerCallback *callback, flatbuffers::FlatBufferBuilder &b)
+        webmanager::eMessageReceiverResult handleRequestList(webmanager::iWebmanagerCallback *callback, uint16_t requestId)
         {
-            std::vector<flatbuffers::Offset<scheduler::ResponseSchedulerListItem>> items;
+            static uint8_t items_scratch[64 * 40];
+            size_t items_pos = 0;
+            size_t items_count = 0;
             for (auto const &[key, val] : name2timer)
             {
-                val->FillListOfResponseSchedulerListItems(b, items);
+                WsProtocol::scheduler::SchedulerListItem::Payload item{};
+                item.name = key.c_str();
+                item.type = val->GetScheduleType();
+                size_t newPos = WsProtocol::scheduler::AppendResponseSchedulerListItemsSchedulerListItemElement(item, items_scratch, items_pos, sizeof(items_scratch));
+                if (newPos > 0) { items_pos = newPos; items_count++; }
             }
-            b.Finish(
-                scheduler::CreateResponseWrapper(
-                    b,
-                    scheduler::Responses::Responses_ResponseSchedulerList,
-                    scheduler::CreateResponseSchedulerListDirect(b, &items).Union()
-                )
-            );
-            return callback->WrapAndSendAsync(scheduler::Namespace::Namespace_Value, b);
+
+            WsProtocol::scheduler::ResponseSchedulerList::Payload resp{};
+            resp.requestId = requestId;
+            resp.itemsData = items_scratch;
+            resp.itemsCount = items_count;
+            resp.itemsDataSize = items_pos;
+
+            static uint8_t buf[4096];
+            size_t len = WsProtocol::scheduler::ResponseSchedulerList::Encode(resp, buf, sizeof(buf));
+            return (len > 0 && callback->SendRawAsync(buf, len) == ESP_OK) ? webmanager::eMessageReceiverResult::OK : webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
         }
 
-        esp_err_t handleRequest(webmanager::iWebmanagerCallback *callback, flatbuffers::FlatBufferBuilder &b, const scheduler::RequestSchedulerDelete *req)
+        webmanager::eMessageReceiverResult handleRequestDelete(webmanager::iWebmanagerCallback *callback, const WsProtocol::scheduler::RequestSchedulerDelete::Payload &req)
         {
-            if (!this->name2timer.contains(req->name()->str()))
-                return ESP_FAIL;
-            this->name2timer.erase(req->name()->str());
-            nvs_erase_key(this->nvsSchedulerHandle, req->name()->c_str());
+            if (!this->name2timer.contains(req.name))
+                return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            this->name2timer.erase(req.name);
+            nvs_erase_key(this->nvsSchedulerHandle, req.name);
             nvs_commit(this->nvsSchedulerHandle);
-            ESP_LOGI(TAG, "Successfully deleted fingerprint %s", req->name()->c_str());
-            return handleRequestList(callback, b);
+            ESP_LOGI(TAG, "Successfully deleted fingerprint %s", req.name);
+            return handleRequestList(callback, req.requestId);
         }
 
-        esp_err_t handleRequest(webmanager::iWebmanagerCallback *callback, flatbuffers::FlatBufferBuilder &b, const scheduler::RequestSchedulerRename *req)
+        webmanager::eMessageReceiverResult handleRequestRename(webmanager::iWebmanagerCallback *callback, const WsProtocol::scheduler::RequestSchedulerRename::Payload &req)
         {
-            if (!this->name2timer.contains(req->old_name()->str()))
-                return ESP_FAIL;
-            if (this->name2timer.contains(req->new_name()->str()))
-                return ESP_FAIL;
-            scheduler::aTimer *o = this->name2timer.at(req->old_name()->str());
+            if (!this->name2timer.contains(req.oldName))
+                return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            if (this->name2timer.contains(req.newName))
+                return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            scheduler::aTimer *o = this->name2timer.at(req.oldName);
             size_t max_size{128};
             uint8_t blob[max_size];
-            o->RenameAndFillNvsBlob(req->new_name()->str(), blob, max_size);
-            this->name2timer.erase(req->old_name()->str());
-            this->name2timer[req->new_name()->str()] = o;
-            nvs_erase_key(this->nvsSchedulerHandle, req->old_name()->c_str());
-            nvs_set_blob(this->nvsSchedulerHandle, req->new_name()->c_str(), blob, max_size);
+            o->RenameAndFillNvsBlob(req.newName, blob, max_size);
+            this->name2timer.erase(req.oldName);
+            this->name2timer[req.newName] = o;
+            nvs_erase_key(this->nvsSchedulerHandle, req.oldName);
+            nvs_set_blob(this->nvsSchedulerHandle, req.newName, blob, max_size);
             nvs_commit(this->nvsSchedulerHandle);
-            ESP_LOGI(TAG, "Successfully renamed fingerprint %s to %s", req->old_name()->c_str(), req->new_name()->c_str());
-            return handleRequestList(callback, b);
+            ESP_LOGI(TAG, "Successfully renamed fingerprint %s to %s", req.oldName, req.newName);
+            return handleRequestList(callback, req.requestId);
         }
 
-        esp_err_t handleRequest(webmanager::iWebmanagerCallback *callback, flatbuffers::FlatBufferBuilder &b, const scheduler::RequestSchedulerSave *req)
+        webmanager::eMessageReceiverResult handleRequestSave(webmanager::iWebmanagerCallback *callback, const WsProtocol::scheduler::RequestSchedulerSave::Payload &req)
         {
-            auto name = req->payload()->name();
-            if (this->name2timer.contains(name->str()))
-            {
-                ESP_LOGI(TAG, "%s is as existing fingerprint -->erase old in map and in flash", name->c_str());
-                scheduler::aTimer *o = this->name2timer.at(name->str());
-                this->name2timer.erase(name->str());
-                nvs_erase_key(this->nvsSchedulerHandle, name->c_str());
-                delete (o);
-            }
-            aTimer *t = Builder::BuildFromFlatbuffer(req->payload());
-            this->name2timer[name->str()] = t;
-            size_t max_size{128};
-            uint8_t blob[max_size];
-            t->FillNvsBlob(blob, max_size);
-            nvs_set_blob(this->nvsSchedulerHandle, name->c_str(), blob, max_size);
-            nvs_commit(this->nvsSchedulerHandle);
-            ESP_LOGI(TAG, "Successfully saved fingerprint %s ", name->c_str());
-            return handleRequestList(callback, b);
+            bool ok = WsProtocol::scheduler::DecodeRequestSchedulerSavePayloadElements(req.payloadData, req.payloadDataSize, 1,
+                [&](auto &schedule) {
+                    std::string name = schedule.name;
+                    if (this->name2timer.contains(name))
+                    {
+                        ESP_LOGI(TAG, "%s is as existing fingerprint -->erase old in map and in flash", name.c_str());
+                        scheduler::aTimer *o = this->name2timer.at(name);
+                        this->name2timer.erase(name);
+                        nvs_erase_key(this->nvsSchedulerHandle, name.c_str());
+                        delete (o);
+                    }
+                    aTimer *t = Builder::BuildFromSchedule(schedule);
+                    if (!t) return;
+                    this->name2timer[name] = t;
+                    size_t max_size{128};
+                    uint8_t blob[max_size];
+                    t->FillNvsBlob(blob, max_size);
+                    nvs_set_blob(this->nvsSchedulerHandle, name.c_str(), blob, max_size);
+                    nvs_commit(this->nvsSchedulerHandle);
+                    ESP_LOGI(TAG, "Successfully saved fingerprint %s ", name.c_str());
+                });
+            if (!ok) return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            return handleRequestList(callback, req.requestId);
         }
 
         void OnBegin(webmanager::iWebmanagerCallback*) override{}
         void OnWifiConnect(webmanager::iWebmanagerCallback*) override{}
         void OnWifiDisconnect(webmanager::iWebmanagerCallback*)override{}
         void OnTimeUpdate(webmanager::iWebmanagerCallback*)override{}
-        webmanager::eMessageReceiverResult ProvideWebsocketMessage(webmanager::iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint32_t ns, uint8_t *buf) override
+        webmanager::eMessageReceiverResult ProvideWebsocketMessage(webmanager::iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint16_t namespaceId, uint16_t messageTypeId, const uint8_t *frame, size_t frameLen) override
         {
-            if (ns != scheduler::Namespace::Namespace_Value)
+            if (namespaceId != WsProtocol::scheduler::NAMESPACE_ID)
                 return webmanager::eMessageReceiverResult::NOT_FOR_ME;
-            auto rw = flatbuffers::GetRoot<scheduler::RequestWrapper>(buf);
-            flatbuffers::FlatBufferBuilder b(1024);
-            switch (rw->request_type())
+            switch (messageTypeId)
             {
-
-            case scheduler::Requests::Requests_RequestSchedulerList:
+            case WsProtocol::scheduler::RequestSchedulerList::TYPE_ID:
             {
-                return handleRequestList(callback, b) == ESP_OK ? webmanager::eMessageReceiverResult::OK : webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                WsProtocol::scheduler::RequestSchedulerList::Payload r{};
+                if (!WsProtocol::scheduler::RequestSchedulerList::Decode(frame, frameLen, r)) return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                return handleRequestList(callback, r.requestId);
             }
-            case scheduler::Requests::Requests_RequestSchedulerDelete:
+            case WsProtocol::scheduler::RequestSchedulerDelete::TYPE_ID:
             {
-                return handleRequest(callback, b, rw->request_as_RequestSchedulerDelete()) == ESP_OK ? webmanager::eMessageReceiverResult::OK : webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                WsProtocol::scheduler::RequestSchedulerDelete::Payload r{};
+                if (!WsProtocol::scheduler::RequestSchedulerDelete::Decode(frame, frameLen, r)) return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                return handleRequestDelete(callback, r);
             }
-            case scheduler::Requests::Requests_RequestSchedulerRename:
+            case WsProtocol::scheduler::RequestSchedulerRename::TYPE_ID:
             {
-                return handleRequest(callback, b, rw->request_as_RequestSchedulerRename()) == ESP_OK ? webmanager::eMessageReceiverResult::OK : webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                WsProtocol::scheduler::RequestSchedulerRename::Payload r{};
+                if (!WsProtocol::scheduler::RequestSchedulerRename::Decode(frame, frameLen, r)) return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                return handleRequestRename(callback, r);
             }
-            case scheduler::Requests::Requests_RequestSchedulerSave:
+            case WsProtocol::scheduler::RequestSchedulerSave::TYPE_ID:
             {
-                return handleRequest(callback, b, rw->request_as_RequestSchedulerSave()) == ESP_OK ? webmanager::eMessageReceiverResult::OK : webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                WsProtocol::scheduler::RequestSchedulerSave::Payload r{};
+                if (!WsProtocol::scheduler::RequestSchedulerSave::Decode(frame, frameLen, r)) return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                return handleRequestSave(callback, r);
             }
-            case scheduler::Requests::Requests_RequestSchedulerOpen:
+            case WsProtocol::scheduler::RequestSchedulerOpen::TYPE_ID:
             {
-                return handleRequest(callback, b, rw->request_as_RequestSchedulerOpen()) == ESP_OK ? webmanager::eMessageReceiverResult::OK : webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                WsProtocol::scheduler::RequestSchedulerOpen::Payload r{};
+                if (!WsProtocol::scheduler::RequestSchedulerOpen::Decode(frame, frameLen, r)) return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                return handleRequestOpen(callback, r);
             }
             default:
-            {
-                break;
+                return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
             }
-            }
-            return webmanager::eMessageReceiverResult::NOT_FOR_ME;
         }
     };
 

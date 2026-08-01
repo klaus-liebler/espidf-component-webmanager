@@ -6,9 +6,7 @@
 
 namespace webmanager{
     constexpr time_t FAR_FUTURE(INT64_MAX);
-    constexpr size_t MAX_AP_NUM{8};    
-    constexpr uint32_t RECONNECTS_ON_STARTUP{3};
-    constexpr uint32_t RECONNECTS_ON_OPERATION{UINT32_MAX};
+    constexpr size_t MAX_AP_NUM{8};
     constexpr BaseType_t RECONNECT_TIMEOUT_US{8'000'000};
     constexpr BaseType_t SHUTDOWN_AP_TIMEOUT_US{30'000'000};
     constexpr BaseType_t COMMON_TIMEOUT_US{30'000'000};

@@ -4,8 +4,8 @@
 #include <map>
 #include <vector>
 #include <string>
-#include <flatbuffers/flatbuffers.h>
-#include <flatbuffers_cpp/ns08scheduler_generated.h>
+#include <type_traits>
+#include "wsprotocol_cpp/ws_protocol.hh"
 #include "esp_random.h"
 #include "sunsetsunrise.hh"
 #define TAG "SCHEDULER"
@@ -21,7 +21,7 @@ namespace scheduler
             return name;
         }
         aTimer(std::string name):name(name){}
-        
+
         virtual ~aTimer(){}
 
         virtual uint16_t GetCurrentValue(time_t unixSecs, int d, int h, int m, int s) const = 0;
@@ -29,10 +29,15 @@ namespace scheduler
         static aTimer* BuildFromBlob(uint8_t* data){return nullptr;}
 
         virtual void NewDayHasBegun(uint32_t julianDay, tms_t todaysSunrise, tms_t  todaysSunset){return;}
-       
-        virtual void FillListOfResponseSchedulerListItems(flatbuffers::FlatBufferBuilder &b, std::vector<flatbuffers::Offset<scheduler::ResponseSchedulerListItem>> &items)=0;
 
-        virtual flatbuffers::Offset<scheduler::Schedule> CreateFlatbufferScheduleOffset(flatbuffers::FlatBufferBuilder &b)=0;
+        virtual WsProtocol::scheduler::ScheduleType GetScheduleType() const = 0;
+
+        // Schreibt NUR die getaggte Variante (classId + Klassenfelder) nach 'dest' -- kein Name, kein
+        // aeusserer Schedule-Rahmen. Der aeussere Rahmen (Schedule::Payload{name, scheduleData,
+        // scheduleDataSize}) wird vom jeweiligen Aufrufer selbst gebaut (FillNvsBlob hier, oder direkt
+        // in scheduler.hh fuer RequestSchedulerSave/ResponseSchedulerOpen), weil deren Encode-Empfaenger
+        // (NVS-Blob vs. Message-Payload) unterschiedliche Puffer-Ziele haben.
+        virtual size_t EncodeScheduleVariant(uint8_t* dest, size_t pos, size_t dest_size) const = 0;
 
         void RenameAndFillNvsBlob(std::string newName, uint8_t* data, size_t& len_in_out){
             this->name=newName;
@@ -40,99 +45,74 @@ namespace scheduler
         }
 
         void FillNvsBlob(uint8_t* data, size_t& len_in_out){
-            flatbuffers::FlatBufferBuilder b(len_in_out);
-            b.Finish(this->CreateFlatbufferScheduleOffset(b));
-            len_in_out = b.GetSize();
-            std::memcpy(data, b.GetBufferPointer(), len_in_out);
+            uint8_t variant_scratch[128];
+            size_t variantLen = EncodeScheduleVariant(variant_scratch, 0, sizeof(variant_scratch));
+            WsProtocol::scheduler::Schedule::Payload payload{};
+            payload.name = name.c_str();
+            payload.scheduleData = variant_scratch;
+            payload.scheduleDataSize = variantLen;
+            size_t written = WsProtocol::scheduler::Schedule::Encode(payload, data, 0, len_in_out);
+            len_in_out = written;
         }
     };
 
-    class cALWAYS: public aTimer
+    // Gemeinsame Basis fuer die 5 fest verdrahteten "Predefined"-Singletons (ALWAYS/NEVER/DAILY_6_22/
+    // WORKING_DAYS_7_18/TestEvenMinutesOnOddMinutesOff) -- spart die vormals 5x identisch kopierten
+    // GetScheduleType()/EncodeScheduleVariant()-Ueberschreibungen.
+    class aPredefinedTimer : public aTimer
     {
-        public:
-        cALWAYS(std::string name):aTimer(name){}
-        void FillListOfResponseSchedulerListItems(flatbuffers::FlatBufferBuilder &b, std::vector<flatbuffers::Offset<scheduler::ResponseSchedulerListItem>> &items) override{
-            items.push_back(scheduler::CreateResponseSchedulerListItemDirect(b, this->name.c_str(), scheduler::eSchedule::eSchedule_Predefined));
+    public:
+        aPredefinedTimer(std::string name):aTimer(name){}
+
+        WsProtocol::scheduler::ScheduleType GetScheduleType() const override
+        {
+            return WsProtocol::scheduler::ScheduleType::PREDEFINED;
         }
 
-        flatbuffers::Offset<scheduler::Schedule> CreateFlatbufferScheduleOffset(flatbuffers::FlatBufferBuilder &b) override{
-            return scheduler::CreateScheduleDirect(b,
-                name.c_str(),
-                scheduler::uSchedule::uSchedule_Predefined,
-                scheduler::CreatePredefined(b).Union()
-                );
+        size_t EncodeScheduleVariant(uint8_t* dest, size_t pos, size_t dest_size) const override
+        {
+            WsProtocol::scheduler::Predefined::Payload item{};
+            return WsProtocol::scheduler::AppendScheduleSchedulePredefinedElement(item, dest, pos, dest_size);
         }
+    };
+
+    class cALWAYS: public aPredefinedTimer
+    {
+        public:
+        cALWAYS(std::string name):aPredefinedTimer(name){}
         protected:
         uint16_t GetCurrentValue(time_t unixSecs, int d, int h, int m, int s) const override
         {
             return UINT16_MAX;
         }
-
-        
     } ALWAYS("ALWAYS");
 
-    class cNEVER: public aTimer
+    class cNEVER: public aPredefinedTimer
     {
         public:
-        cNEVER(std::string name):aTimer(name){}
-        void FillListOfResponseSchedulerListItems(flatbuffers::FlatBufferBuilder &b, std::vector<flatbuffers::Offset<scheduler::ResponseSchedulerListItem>> &items) override{
-            items.push_back(scheduler::CreateResponseSchedulerListItemDirect(b, this->name.c_str(), scheduler::eSchedule::eSchedule_Predefined));
-        }
-        flatbuffers::Offset<scheduler::Schedule> CreateFlatbufferScheduleOffset(flatbuffers::FlatBufferBuilder &b) override{
-            return scheduler::CreateScheduleDirect(b,
-                name.c_str(),
-                scheduler::uSchedule::uSchedule_Predefined,
-                scheduler::CreatePredefined(b).Union()
-                );
-        }
+        cNEVER(std::string name):aPredefinedTimer(name){}
         protected:
         uint16_t GetCurrentValue(time_t unixSecs, int d, int h, int m, int s) const override
         {
             return 0;
         }
-
-
-        
     } NEVER("NEVER");
 
-    class cDAILY_6_22: public aTimer
+    class cDAILY_6_22: public aPredefinedTimer
     {
         public:
-        cDAILY_6_22(std::string name):aTimer(name){}
-        void FillListOfResponseSchedulerListItems(flatbuffers::FlatBufferBuilder &b, std::vector<flatbuffers::Offset<scheduler::ResponseSchedulerListItem>> &items) override{
-            items.push_back(scheduler::CreateResponseSchedulerListItemDirect(b, this->name.c_str(), scheduler::eSchedule::eSchedule_Predefined));
-        }
-
-        flatbuffers::Offset<scheduler::Schedule> CreateFlatbufferScheduleOffset(flatbuffers::FlatBufferBuilder &b) override{
-            return scheduler::CreateScheduleDirect(b,
-                name.c_str(),
-                scheduler::uSchedule::uSchedule_Predefined,
-                scheduler::CreatePredefined(b).Union()
-                );
-        }
+        cDAILY_6_22(std::string name):aPredefinedTimer(name){}
         protected:
-
         uint16_t GetCurrentValue(time_t unixSecs, int d, int h, int m, int s) const override
         {
             return (h >= 6 && h < 22)?UINT16_MAX:0;
         }
-
     } DAILY_6_22("DAILY_6_22");
 
-    class cWORKING_DAYS_7_18: public aTimer
+    class cWORKING_DAYS_7_18: public aPredefinedTimer
     {
         public:
-        cWORKING_DAYS_7_18(std::string name):aTimer(name){}
-        void FillListOfResponseSchedulerListItems(flatbuffers::FlatBufferBuilder &b, std::vector<flatbuffers::Offset<scheduler::ResponseSchedulerListItem>> &items) override{
-            items.push_back(scheduler::CreateResponseSchedulerListItemDirect(b, this->name.c_str(), scheduler::eSchedule::eSchedule_Predefined));
-        }
-        flatbuffers::Offset<scheduler::Schedule> CreateFlatbufferScheduleOffset(flatbuffers::FlatBufferBuilder &b) override{
-            return scheduler::CreateScheduleDirect(b,
-                name.c_str(),
-                scheduler::uSchedule::uSchedule_Predefined,
-                scheduler::CreatePredefined(b).Union()
-                );
-        }
+        cWORKING_DAYS_7_18(std::string name):aPredefinedTimer(name){}
         protected:
         uint16_t GetCurrentValue(time_t unixSecs, int d, int h, int m, int s) const override
         {
@@ -140,31 +120,18 @@ namespace scheduler
                 return 0;
             return (h >= 7 && h < 18)?UINT16_MAX:0;
         }
-
     } WORKING_DAYS_7_18("WORKING_DAYS_7_18");
 
 
-    class cTestEvenMinutesOnOddMinutesOff: public aTimer
+    class cTestEvenMinutesOnOddMinutesOff: public aPredefinedTimer
     {
         public:
-        cTestEvenMinutesOnOddMinutesOff(std::string name):aTimer(name){}
-        
-        void FillListOfResponseSchedulerListItems(flatbuffers::FlatBufferBuilder &b, std::vector<flatbuffers::Offset<scheduler::ResponseSchedulerListItem>> &items) override{
-            items.push_back(scheduler::CreateResponseSchedulerListItemDirect(b, this->name.c_str(), scheduler::eSchedule::eSchedule_Predefined));
-        }
-        flatbuffers::Offset<scheduler::Schedule> CreateFlatbufferScheduleOffset(flatbuffers::FlatBufferBuilder &b) override{
-            return scheduler::CreateScheduleDirect(b,
-                name.c_str(),
-                scheduler::uSchedule::uSchedule_Predefined,
-                scheduler::CreatePredefined(b).Union()
-                );
-        }
+        cTestEvenMinutesOnOddMinutesOff(std::string name):aPredefinedTimer(name){}
         protected:
         uint16_t GetCurrentValue(time_t unixSecs, int d, int h, int m, int s) const override
         {
             return (m%2==0)?UINT16_MAX:0;
         }
-
     } TestEvenMinutesOnOddMinutesOff("TestEvenOdd");
 
     class OneWeekIn15MinutesTimer :public aTimer{
@@ -180,30 +147,22 @@ namespace scheduler
             return (twoHours&(1<<fifteenMinutesSlot))?UINT16_MAX:0;
         }
 
-        static aTimer* BuildFromFlatbuffer(std::string name, const scheduler::OneWeekIn15Minutes *owi15m){
-            
-            auto data_buf = owi15m->data()->v();
+        static aTimer* BuildFromWsProtocol(std::string name, const WsProtocol::scheduler::OneWeekIn15Minutes::Payload &owi15m){
             std::array<uint8_t, 84> data;
-            for (int i = 0; i < 84; i++)
-            {
-                data[i] = data_buf->Get(i);
-            }
+            std::memcpy(data.data(), owi15m.data.v, 84);
             return new scheduler::OneWeekIn15MinutesTimer(name, data);
         }
 
-
-        void FillListOfResponseSchedulerListItems(flatbuffers::FlatBufferBuilder &b, std::vector<flatbuffers::Offset<scheduler::ResponseSchedulerListItem>> &items) override{
-            items.push_back(scheduler::CreateResponseSchedulerListItemDirect(b, this->name.c_str(), scheduler::eSchedule::eSchedule_OneWeekIn15Minutes));
+        WsProtocol::scheduler::ScheduleType GetScheduleType() const override
+        {
+            return WsProtocol::scheduler::ScheduleType::ONE_WEEK_IN_15_MINUTES;
         }
 
-        flatbuffers::Offset<scheduler::Schedule> CreateFlatbufferScheduleOffset(flatbuffers::FlatBufferBuilder &b) override{
-            ESP_LOGI(TAG, "Create Offset<scheduler::Schedule> for OneWeekIn15MinutesTimer %s", name.c_str());
-            scheduler::OneWeekIn15MinutesData owi15md(data);
-            return scheduler::CreateScheduleDirect(b,
-                name.c_str(),
-                scheduler::uSchedule::uSchedule_OneWeekIn15Minutes,
-                scheduler::CreateOneWeekIn15Minutes(b, &owi15md).Union()
-                );
+        size_t EncodeScheduleVariant(uint8_t* dest, size_t pos, size_t dest_size) const override
+        {
+            WsProtocol::scheduler::OneWeekIn15Minutes::Payload item{};
+            std::memcpy(item.data.v, data.data(), 84);
+            return WsProtocol::scheduler::AppendScheduleScheduleOneWeekIn15MinutesElement(item, dest, pos, dest_size);
         }
     };
 
@@ -216,23 +175,24 @@ namespace scheduler
 
         public:
         SunRandomTimer(std::string the_name, float offsetHours, float randomHours):aTimer(the_name), offsetHours(offsetHours), randomHours(randomHours){
-            
-        }
-        flatbuffers::Offset<scheduler::Schedule> CreateFlatbufferScheduleOffset(flatbuffers::FlatBufferBuilder &b) override{
-            ESP_LOGI(TAG, "Create Offset<scheduler::Schedule> for SunRandom %s", name.c_str());
-            return scheduler::CreateScheduleDirect(b,
-                name.c_str(),
-                scheduler::uSchedule::uSchedule_SunRandom,
-                scheduler::CreateSunRandom(b, offsetHours*60, randomHours*60).Union()
-                );
+
         }
 
-        static aTimer* BuildFromFlatbuffer(std::string name, const scheduler::SunRandom *sr){
-            return new scheduler::SunRandomTimer(name, sr->offset_minutes() / 60.0, sr->random_minutes() / 60.0);
+        WsProtocol::scheduler::ScheduleType GetScheduleType() const override
+        {
+            return WsProtocol::scheduler::ScheduleType::SUN_RANDOM;
         }
 
-        void FillListOfResponseSchedulerListItems(flatbuffers::FlatBufferBuilder &b, std::vector<flatbuffers::Offset<scheduler::ResponseSchedulerListItem>> &items) override{
-            items.push_back(scheduler::CreateResponseSchedulerListItemDirect(b, this->name.c_str(), scheduler::eSchedule::eSchedule_SunRandom));
+        size_t EncodeScheduleVariant(uint8_t* dest, size_t pos, size_t dest_size) const override
+        {
+            WsProtocol::scheduler::SunRandom::Payload item{};
+            item.offsetMinutes = (uint16_t)(offsetHours*60);
+            item.randomMinutes = (uint16_t)(randomHours*60);
+            return WsProtocol::scheduler::AppendScheduleScheduleSunRandomElement(item, dest, pos, dest_size);
+        }
+
+        static aTimer* BuildFromWsProtocol(std::string name, const WsProtocol::scheduler::SunRandom::Payload &sr){
+            return new scheduler::SunRandomTimer(name, sr.offsetMinutes / 60.0, sr.randomMinutes / 60.0);
         }
 
         uint16_t GetCurrentValue(time_t unixSecs, int d, int h, int m, int s) const override
@@ -243,7 +203,7 @@ namespace scheduler
 
 
         void NewDayHasBegun(uint32_t julianDay, time_t todaysSunriseUnixSecs, time_t todaysSunsetUnixSecs) override{
-            
+
 
             float randomSunriseHours = (((float)esp_random()/(float)UINT32_MAX)*2*randomHours)-randomHours;
             float randomSunsetHours = (((float)esp_random()/(float)UINT32_MAX)*2*randomHours)-randomHours;
@@ -255,17 +215,26 @@ namespace scheduler
 
     class Builder{
         public:
-        static aTimer* BuildFromFlatbuffer(const scheduler::Schedule *schedule){
-            switch(schedule->schedule_type()){
-                case scheduler::uSchedule::uSchedule_OneWeekIn15Minutes: return OneWeekIn15MinutesTimer::BuildFromFlatbuffer(schedule->name()->str(), schedule->schedule_as_OneWeekIn15Minutes());
-                case scheduler::uSchedule::uSchedule_SunRandom: return SunRandomTimer::BuildFromFlatbuffer(schedule->name()->str(), schedule->schedule_as_SunRandom());
-                default: return nullptr;
-            }
-            return nullptr;
+        // Deckt (wie schon die vormalige Flatbuffers-Fassung) nur OneWeekIn15Minutes/SunRandom ab --
+        // ein aus NVS geladenes "Predefined"-Schedule kann nicht rekonstruiert werden (die 5 Predefined-
+        // Varianten sind fest verdrahtete Singletons, kein generischer Predefined-aTimer-Typ), faellt
+        // also auf nullptr zurueck, exakt wie zuvor.
+        static aTimer* BuildFromSchedule(const WsProtocol::scheduler::Schedule::Payload &schedule){
+            aTimer* result = nullptr;
+            WsProtocol::scheduler::DecodeScheduleScheduleElements(schedule.scheduleData, schedule.scheduleDataSize, 1,
+                [&](auto &variant) {
+                    using T = std::decay_t<decltype(variant)>;
+                    if constexpr (std::is_same_v<T, WsProtocol::scheduler::OneWeekIn15Minutes::Payload>) {
+                        result = OneWeekIn15MinutesTimer::BuildFromWsProtocol(schedule.name, variant);
+                    } else if constexpr (std::is_same_v<T, WsProtocol::scheduler::SunRandom::Payload>) {
+                        result = SunRandomTimer::BuildFromWsProtocol(schedule.name, variant);
+                    }
+                });
+            return result;
         }
     };
-    
-   
-    
+
+
+
 }
 #undef TAG

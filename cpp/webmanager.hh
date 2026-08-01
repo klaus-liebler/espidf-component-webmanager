@@ -47,7 +47,7 @@
 #include "webmanager_constants.hh"
 #include "webmanager_interfaces.hh"
 #include "webmanager_async_response.hh"
-#include "flatbuffers_cpp/ns01wifimanager_generated.h"
+#include "wsprotocol_cpp/ws_protocol.hh"
 
 namespace webmanager
 {
@@ -88,8 +88,23 @@ namespace webmanager
         time_t tReconnect_us{INT64_MAX};
 
         bool staConnectionState{false};
-        
-        uint32_t remainingAttempsToConnectAsSTA{1};
+
+        // Deadline-Modell fuer den AP-Fallback (ersetzt den vormaligen Attempt-Zaehler
+        // remainingAttempsToConnectAsSTA/RECONNECTS_ON_STARTUP/RECONNECTS_ON_OPERATION, s.
+        // docs/plan_v2/03-wifimanager-review.md): apFallbackTimeout_us wird einmalig in Begin()
+        // gesetzt (konstant danach), giveUpAt_us wird beim ERSTEN Disconnect einer Serie scharf-
+        // geschaltet (now_us + apFallbackTimeout_us) und bei erfolgreichem Connect wieder auf
+        // FAR_FUTURE zurueckgesetzt. FAR_FUTURE als Sentinel fuer apFallbackTimeout_us bedeutet
+        // "nie AP oeffnen, fuer immer weiterversuchen" (heutiges Verhalten, Default).
+        time_t apFallbackTimeout_us{FAR_FUTURE};
+        time_t giveUpAt_us{FAR_FUTURE};
+
+        // Korrelations-ID des zuletzt entgegengenommenen RequestWifiConnect -- wird gebraucht,
+        // weil ResponseWifiConnect asynchron aus wifi_event_handler/ip_event_handler heraus
+        // verschickt wird (nicht direkt aus dem Request-Handler), die requestId des Requests aber
+        // trotzdem unveraendert in der Response zurueckgegeben werden soll (s. Schema-Kommentar
+        // in ws-protocol/wifimanager.cs).
+        uint16_t lastWifiConnectRequestId{0};
 
         const char* ws2c(WorkingState w){
             return WorkingStateStrings[static_cast<size_t>(w)];
@@ -131,9 +146,8 @@ namespace webmanager
 
         M() { http_buffer = new uint8_t[HTTP_BUFFER_SIZE]; }
 
-        void connectAsSTA(time_t now_us, uint32_t remainingAttempsToConnectAsSTA)
+        void connectAsSTA(time_t now_us)
         {
-            this->remainingAttempsToConnectAsSTA = remainingAttempsToConnectAsSTA;
             ESP_LOGI(TAG, "Trying to connect as station. {'ssid':'%s', 'password':'%s', 'fallback':'%s'}", wifi_config_sta.sta.ssid, wifi_config_sta.sta.password, fallbackToStoredStaConfig?"STORED_STA":"AP");
             ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config_sta));
             ESP_ERROR_CHECK(esp_wifi_connect());
@@ -156,26 +170,36 @@ namespace webmanager
 
         void sendWifiConnectionNotSuccessfulMessage()
         {
-            flatbuffers::FlatBufferBuilder b(256);
-            b.Finish(
-                wifimanager::CreateResponseWrapper(
-                    b,
-                    wifimanager::Responses::Responses_ResponseWifiConnect,
-                    wifimanager::CreateResponseWifiConnectDirect(b, false, "", 0, 0, 0).Union()));
-            WrapAndSendAsync(wifimanager::Namespace::Namespace_Value, b);
+            WsProtocol::wifimanager::ResponseWifiConnect::Payload resp{};
+            resp.requestId = lastWifiConnectRequestId;
+            resp.success = false;
+            resp.ssid = "";
+            resp.ip = 0;
+            resp.netmask = 0;
+            resp.gateway = 0;
+            resp.rssi = 0;
+            uint8_t buf[256];
+            size_t len = WsProtocol::wifimanager::ResponseWifiConnect::Encode(resp, buf, sizeof(buf));
+            if (len > 0) SendRawAsync(buf, len);
         }
 
         void sendWifiConnectionSuccessfulMessage(const esp_netif_ip_info_t *ip){
             create_or_update_sta_config();
             wifi_ap_record_t ap = {};
             esp_wifi_sta_get_ap_info(&ap);
-            flatbuffers::FlatBufferBuilder b(256);
-            b.Finish(
-                wifimanager::CreateResponseWrapper(
-                    b,
-                    wifimanager::Responses::Responses_ResponseWifiConnect,
-                    wifimanager::CreateResponseWifiConnectDirect(b, true, (char *)wifi_config_sta.sta.ssid, ip->ip.addr, ip->netmask.addr, ip->gw.addr).Union()));
-            WrapAndSendAsync(wifimanager::Namespace::Namespace_Value, b);
+            // 'ap.rssi' wurde zuvor geholt, aber nie in die Response geschrieben (echter Bug,
+            // per Recherche bestaetigt) -- jetzt korrekt gesetzt.
+            WsProtocol::wifimanager::ResponseWifiConnect::Payload resp{};
+            resp.requestId = lastWifiConnectRequestId;
+            resp.success = true;
+            resp.ssid = (const char*)wifi_config_sta.sta.ssid;
+            resp.ip = ip->ip.addr;
+            resp.netmask = ip->netmask.addr;
+            resp.gateway = ip->gw.addr;
+            resp.rssi = ap.rssi;
+            uint8_t buf[256];
+            size_t len = WsProtocol::wifimanager::ResponseWifiConnect::Encode(resp, buf, sizeof(buf));
+            if (len > 0) SendRawAsync(buf, len);
         }
 
         esp_err_t delete_sta_config()
@@ -280,11 +304,19 @@ namespace webmanager
                 break;
             case WIFI_EVENT_STA_DISCONNECTED:
                 staConnectionState = false;
-                if (remainingAttempsToConnectAsSTA == 0){
+                // Deadline nur beim ERSTEN Disconnect einer Serie scharfschalten -- nachfolgende
+                // Disconnects innerhalb derselben Serie (waehrend wir schon am Zurueckverbinden
+                // sind) duerfen die urspruengliche Deadline nicht immer wieder nach hinten
+                // verschieben, sonst wuerde (wie im alten Zaehler-Modell) nie aufgegeben.
+                if (giveUpAt_us == FAR_FUTURE){
+                    giveUpAt_us = now_us + apFallbackTimeout_us;
+                }
+                if (now_us > giveUpAt_us){
                     if(fallbackToStoredStaConfig && read_sta_config()){
                         ESP_LOGW(TAG, "Establishing connection to new SSID failed finally. Go back to stored SSID {'ssid':'%s', 'password':'%s'}", wifi_config_ap.ap.ssid, wifi_config_ap.ap.password);
                         fallbackToStoredStaConfig=false;
-                        connectAsSTA(now_us, 1);
+                        giveUpAt_us = now_us + apFallbackTimeout_us;
+                        connectAsSTA(now_us);
                         this->setStatus(WorkingState::KEEP_CONNECTION, now_us + COMMON_TIMEOUT_US);
                         this->sendWifiConnectionNotSuccessfulMessage();
                     }
@@ -295,7 +327,7 @@ namespace webmanager
                     }
                 }
                 else{
-                    ESP_LOGW(TAG, "Establishing connection with SSID '%s' failed. Still %lu attempts to try.", wifi_config_sta.sta.ssid, remainingAttempsToConnectAsSTA);
+                    ESP_LOGW(TAG, "Establishing connection with SSID '%s' failed. Retrying until %lldms.", wifi_config_sta.sta.ssid, giveUpAt_us/1000);
                     this->setStatus(WorkingState::KEEP_CONNECTION, now_us + COMMON_TIMEOUT_US, FAR_FUTURE, now_us+RECONNECT_TIMEOUT_US);
                 }
                 break;
@@ -304,7 +336,7 @@ namespace webmanager
                 staConnectionState = true;
                 create_or_update_sta_config();
                 fallbackToStoredStaConfig=true;
-                this->remainingAttempsToConnectAsSTA=RECONNECTS_ON_OPERATION;
+                this->giveUpAt_us=FAR_FUTURE;
                 //Das Timeout muss hier auf einen sinnvollen wert gesetzt werden, weil wir ja noch keine IP-Adresse haben
                 //erst wenn diese im IP-Handler gesetzt wird, kann das timeout auf FAR-FUTURE gesetzt werden
                 this->setStatus(WorkingState::KEEP_CONNECTION, now_us + COMMON_TIMEOUT_US, FAR_FUTURE, FAR_FUTURE);
@@ -510,118 +542,128 @@ namespace webmanager
                 delete[] buf;
                 return ESP_OK;
             }
-            uint32_t ns = *((uint32_t *)buf);
-            uint8_t *fb_buf = buf + 4;
-            if (ns == wifimanager::Namespace::Namespace_Value)
+            uint16_t namespaceId = (uint16_t)(buf[0] | (buf[1] << 8));
+            uint16_t messageTypeId = (uint16_t)(buf[2] | (buf[3] << 8));
+            eMessageReceiverResult success = ProvideWebsocketMessage(this, req, &ws_pkt, namespaceId, messageTypeId, buf, ws_pkt.len);
+            if (success == eMessageReceiverResult::NOT_FOR_ME && plugins)
             {
-                auto rw = flatbuffers::GetRoot<wifimanager::RequestWrapper>(fb_buf);
-                wifimanager::Requests reqType = rw->request_type();
-                ESP_LOGI(TAG, "Received wifimanager request: len=%d, requestType=%d ", (int)ws_pkt.len, reqType);
-                switch (reqType)
+                for (auto p : *plugins)
                 {
-                case wifimanager::Requests::Requests_RequestNetworkInformation:
-                    sendResponseNetworkInformation(req, &ws_pkt, rw->request_as_RequestNetworkInformation());
-                    break;
-
-                case wifimanager::Requests::Requests_RequestWifiConnect:
-                    handleRequestWifiConnect(req, &ws_pkt, rw->request_as_RequestWifiConnect());
-                    break;
-                case wifimanager::Requests::Requests_RequestWifiDisconnect:
-                    handleRequestWifiDisconnect(req, &ws_pkt, rw->request_as_RequestWifiDisconnect());
-                    break;
-                default:
-                    break;
-                }
-            }
-            else
-            {
-                eMessageReceiverResult success{eMessageReceiverResult::NOT_FOR_ME};
-                if (plugins)
-                {
-                    for (auto p : *plugins)
+                    success = p->ProvideWebsocketMessage(this, req, &ws_pkt, namespaceId, messageTypeId, buf, ws_pkt.len);
+                    if (success != eMessageReceiverResult::NOT_FOR_ME)
                     {
-                        success = p->ProvideWebsocketMessage(this, req, &ws_pkt, ns, fb_buf);
-                        if (success != eMessageReceiverResult::NOT_FOR_ME)
-                        {
-                            break;
-                        }
+                        break;
                     }
                 }
-                if (success == eMessageReceiverResult::NOT_FOR_ME)
-                {
-                    ESP_LOGW(TAG, "Not yet implemented request for namespace %lu, neither internal nor in a plugin", ns);
-                }
-                else if (success == eMessageReceiverResult::FOR_ME_BUT_FAILED)
-                {
-                    ESP_LOGW(TAG, "Request for namespace %lu has been implemented by plugin, but processing failed", ns);
-                }
+            }
+            if (success == eMessageReceiverResult::NOT_FOR_ME)
+            {
+                ESP_LOGW(TAG, "Not yet implemented request for namespace %u, neither internal nor in a plugin", (unsigned)namespaceId);
+            }
+            else if (success == eMessageReceiverResult::FOR_ME_BUT_FAILED)
+            {
+                ESP_LOGW(TAG, "Request for namespace %u has been implemented by plugin, but processing failed", (unsigned)namespaceId);
             }
             delete[] buf;
             return ESP_OK;
         }
 
-        esp_err_t handleRequestWifiConnect(httpd_req_t *req, httpd_ws_frame_t *ws_pkt, const wifimanager::RequestWifiConnect *wifiConnect)
+        // wifimanager wird hier direkt (nicht ueber den generischen 'plugins'-Vektor) behandelt,
+        // weil es eng mit der WLAN-State-Machine dieser Klasse verzahnt ist -- funktional aber ein
+        // regulaerer iWebmanagerPlugin-Aufruf wie jeder andere Namespace, kein Sonderfall im
+        // Dispatcher mehr (anders als vorher).
+        eMessageReceiverResult ProvideWebsocketMessage(iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint16_t namespaceId, uint16_t messageTypeId, const uint8_t *frame, size_t frameLen)
         {
+            if (namespaceId != WsProtocol::wifimanager::NAMESPACE_ID)
+                return eMessageReceiverResult::NOT_FOR_ME;
+            switch (messageTypeId)
+            {
+            case WsProtocol::wifimanager::RequestNetworkInformation::TYPE_ID:
+                return sendResponseNetworkInformation(frame, frameLen);
+            case WsProtocol::wifimanager::RequestWifiConnect::TYPE_ID:
+                return handleRequestWifiConnect(frame, frameLen);
+            case WsProtocol::wifimanager::RequestWifiDisconnect::TYPE_ID:
+                return handleRequestWifiDisconnect(frame, frameLen);
+            default:
+                return eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            }
+        }
+
+        eMessageReceiverResult handleRequestWifiConnect(const uint8_t *frame, size_t frameLen)
+        {
+            WsProtocol::wifimanager::RequestWifiConnect::Payload req{};
+            if (!WsProtocol::wifimanager::RequestWifiConnect::Decode(frame, frameLen, req))
+                return eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            lastWifiConnectRequestId = req.requestId;
 
             esp_err_t ret{ESP_OK};
             time_t now_us{0};
-            const char *ssid = wifiConnect->ssid()->c_str();
-            const char *password = wifiConnect->password()->c_str();
             size_t len{0};
-            len = strlen(ssid);
+            len = strlen(req.ssid);
             ESP_GOTO_ON_FALSE(len <= MAX_SSID_LEN - 1, ESP_FAIL, negativeresponse, TAG, "SSID too long");
-            len = strlen(password);
+            len = strlen(req.password);
             ESP_GOTO_ON_FALSE(len <= MAX_PASSPHRASE_LEN - 1, ESP_FAIL, negativeresponse, TAG, "PASSPHRASE too long");
             ESP_GOTO_ON_FALSE(len > 0, ESP_FAIL, negativeresponse, TAG, "no PASSPHRASE given");
-            strncpy((char *)wifi_config_sta.sta.ssid, ssid, MAX_SSID_LEN - 1);
-            strncpy((char *)wifi_config_sta.sta.password, password, MAX_PASSPHRASE_LEN - 1 );
-            wifi_config_sta.sta.ssid[MAX_SSID_LEN - 1] = '\0'; 
+            strncpy((char *)wifi_config_sta.sta.ssid, req.ssid, MAX_SSID_LEN - 1);
+            strncpy((char *)wifi_config_sta.sta.password, req.password, MAX_PASSPHRASE_LEN - 1 );
+            wifi_config_sta.sta.ssid[MAX_SSID_LEN - 1] = '\0';
             wifi_config_sta.sta.password[MAX_PASSPHRASE_LEN - 1] = '\0';
             ESP_LOGI(TAG, "Got a new ssid '%s' and password '%s' from browser.", wifi_config_sta.sta.ssid, wifi_config_sta.sta.password);
             if (!xSemaphoreTake(webmanager_semaphore, portMAX_DELAY))
-                return ESP_FAIL;
+                return eMessageReceiverResult::FOR_ME_BUT_FAILED;
             now_us = esp_timer_get_time();
-            connectAsSTA(now_us, 1);
+            giveUpAt_us = now_us + apFallbackTimeout_us;
+            connectAsSTA(now_us);
             xSemaphoreGive(webmanager_semaphore);
-            return ret;
+            return eMessageReceiverResult::OK;
         negativeresponse:
-            flatbuffers::FlatBufferBuilder b(256);
-            b.Finish(
-                wifimanager::CreateResponseWrapper(
-                    b,
-                    wifimanager::Responses::Responses_ResponseWifiConnect,
-                    wifimanager::CreateResponseWifiConnectDirect(b, false, (char *)wifi_config_sta.sta.ssid, 0, 0, 0, 0).Union()));
-            return WrapAndSendAsync(wifimanager::Namespace::Namespace_Value, b);
+            {
+                WsProtocol::wifimanager::ResponseWifiConnect::Payload resp{};
+                resp.requestId = req.requestId;
+                resp.success = false;
+                resp.ssid = (const char*)wifi_config_sta.sta.ssid;
+                resp.ip = 0;
+                resp.netmask = 0;
+                resp.gateway = 0;
+                resp.rssi = 0;
+                uint8_t buf[256];
+                size_t n = WsProtocol::wifimanager::ResponseWifiConnect::Encode(resp, buf, sizeof(buf));
+                return (n > 0 && SendRawAsync(buf, n) == ESP_OK) ? eMessageReceiverResult::OK : eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            }
         }
 
-        esp_err_t handleRequestWifiDisconnect(httpd_req_t *req, httpd_ws_frame_t *ws_pkt, const wifimanager::RequestWifiDisconnect *wifiDisconnect)
+        eMessageReceiverResult handleRequestWifiDisconnect(const uint8_t *frame, size_t frameLen)
         {
-            
-            flatbuffers::FlatBufferBuilder b(256);
-            b.Finish(
-                wifimanager::CreateResponseWrapper(
-                    b,
-                    wifimanager::Responses::Responses_ResponseWifiDisconnect,
-                    wifimanager::CreateResponseWifiDisconnect(b).Union()));
-            WrapAndSendAsync(wifimanager::Namespace::Namespace_Value, b);
-            vTaskDelay(pdMS_TO_TICKS(2000)); // warte 200ms, um die Beantwortung des Requests noch zu ermöglichen
+            WsProtocol::wifimanager::RequestWifiDisconnect::Payload req{};
+            if (!WsProtocol::wifimanager::RequestWifiDisconnect::Decode(frame, frameLen, req))
+                return eMessageReceiverResult::FOR_ME_BUT_FAILED;
+
+            WsProtocol::wifimanager::ResponseWifiDisconnect::Payload resp{};
+            resp.requestId = req.requestId;
+            uint8_t buf[64];
+            size_t len = WsProtocol::wifimanager::ResponseWifiDisconnect::Encode(resp, buf, sizeof(buf));
+            if (len > 0) SendRawAsync(buf, len);
+            vTaskDelay(pdMS_TO_TICKS(2000)); // warte 2s, um die Beantwortung des Requests noch zu ermöglichen
 
             if (!xSemaphoreTake(webmanager_semaphore, portMAX_DELAY))
-                return ESP_FAIL;
+                return eMessageReceiverResult::FOR_ME_BUT_FAILED;
             ESP_ERROR_CHECK(esp_wifi_disconnect());
             delete_sta_config();
             ESP_LOGI(TAG, "Disconnected as STA from ssid '%s'.", wifi_config_sta.sta.ssid);
             configureAndOpenAccessPointAndSetStatus();
             xSemaphoreGive(webmanager_semaphore);
-            return ESP_OK;
+            return eMessageReceiverResult::OK;
         }
 
-        esp_err_t sendResponseNetworkInformation(httpd_req_t *req, httpd_ws_frame_t *ws_pkt, const wifimanager::RequestNetworkInformation *netInfo)
+        eMessageReceiverResult sendResponseNetworkInformation(const uint8_t *frame, size_t frameLen)
         {
-            //bool forceUpdate = netInfo->force_new_search();
-            ESP_LOGI(TAG, "Prepare to send CreateResponseNetworkInformationDirect");
+            WsProtocol::wifimanager::RequestNetworkInformation::Payload req{};
+            if (!WsProtocol::wifimanager::RequestNetworkInformation::Decode(frame, frameLen, req))
+                return eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            //bool forceUpdate = req.forceNewSearch;
+            ESP_LOGI(TAG, "Prepare to send ResponseNetworkInformation");
             esp_err_t ret{ESP_OK};
-            
+
             wifi_ap_record_t *ap{nullptr};
             wifi_ap_record_t my_ap={};
             esp_netif_ip_info_t ap_ip_info = {};
@@ -629,20 +671,31 @@ namespace webmanager
             wifi_ap_record_t accessp_records[MAX_AP_NUM];
             uint16_t accessp_records_len = MAX_AP_NUM;
 
-            flatbuffers::FlatBufferBuilder b(1024);
-            std::vector<flatbuffers::Offset<wifimanager::AccessPoint>> ap_vector;
+            // Grosszuegig bemessen: bis zu MAX_AP_NUM Elemente, je [classId:u16][ssid<=32+null]
+            // [primaryChannel:i32][rssi:i32][authMode:i32].
+            uint8_t ap_scratch[MAX_AP_NUM * 64];
+            size_t ap_scratch_pos = 0;
+            size_t ap_appended = 0;
 
             //if (!xSemaphoreTake(webmanager_semaphore, portMAX_DELAY)) return ESP_ERR_INVALID_STATE;
 
             GOTO_ERROR_ON_ERROR(esp_wifi_scan_start(nullptr, true), "Wifi Scan did NOT complete successfully.");
             GOTO_ERROR_ON_ERROR(esp_wifi_scan_get_ap_records(&accessp_records_len, accessp_records), "Could not get access point list");
             ESP_LOGI(TAG, "Wifi Scan successfully completed. Found %d access points.", accessp_records_len);
-            
-            
+
+
             for (size_t i = 0; i < accessp_records_len; i++)
             {
                 ap = accessp_records + i;
-                ap_vector.push_back(wifimanager::CreateAccessPoint(b, b.CreateString((char *)ap->ssid), ap->primary, ap->rssi, ap->authmode));
+                WsProtocol::wifimanager::AccessPoint::Payload item{};
+                item.ssid = (const char*)ap->ssid;
+                item.primaryChannel = ap->primary;
+                item.rssi = ap->rssi;
+                item.authMode = (int)ap->authmode;
+                size_t newPos = WsProtocol::wifimanager::AppendResponseNetworkInformationAccesspointsAccessPointElement(item, ap_scratch, ap_scratch_pos, sizeof(ap_scratch));
+                if (newPos == 0) break; // Scratch-Puffer voll -- restliche APs auslassen statt abzustuerzen
+                ap_scratch_pos = newPos;
+                ap_appended++;
                 ESP_LOGI(TAG, "  AP %25s; %4d", (char *)ap->ssid, ap->rssi);
             }
 
@@ -651,27 +704,28 @@ namespace webmanager
             esp_wifi_sta_get_ap_info(&my_ap);
         error:
             //xSemaphoreGive(webmanager_semaphore);
-            b.Finish(
-                wifimanager::CreateResponseWrapper(
-                    b,
-                    wifimanager::Responses::Responses_ResponseNetworkInformation,
-                    wifimanager::CreateResponseNetworkInformationDirect(
-                        b,
-                        hostname,
-                        (char *)wifi_config_ap.ap.ssid,
-                        (char *)wifi_config_ap.ap.password,
-                        ap_ip_info.ip.addr,
-                        this->staConnectionState,
-                        (char *)wifi_config_sta.sta.ssid,
-                        sta_ip_info.ip.addr,
-                        sta_ip_info.netmask.addr,
-                        sta_ip_info.gw.addr,
-                        my_ap.rssi,
-                        &ap_vector)
-                        .Union()));
+            {
+                WsProtocol::wifimanager::ResponseNetworkInformation::Payload resp{};
+                resp.requestId = req.requestId;
+                resp.hostname = hostname;
+                resp.ssidAp = (const char*)wifi_config_ap.ap.ssid;
+                resp.passwordAp = (const char*)wifi_config_ap.ap.password;
+                resp.ipAp = ap_ip_info.ip.addr;
+                resp.isConnectedSta = this->staConnectionState;
+                resp.ssidSta = (const char*)wifi_config_sta.sta.ssid;
+                resp.ipSta = sta_ip_info.ip.addr;
+                resp.netmaskSta = sta_ip_info.netmask.addr;
+                resp.gatewaySta = sta_ip_info.gw.addr;
+                resp.rssiSta = my_ap.rssi;
+                resp.accesspointsData = ap_scratch;
+                resp.accesspointsCount = ap_appended;
+                resp.accesspointsDataSize = ap_scratch_pos;
 
-            ret= WrapAndSendAsync(wifimanager::Namespace::Namespace_Value, b);
-            return ret;
+                uint8_t buf[1536];
+                size_t len = WsProtocol::wifimanager::ResponseNetworkInformation::Encode(resp, buf, sizeof(buf));
+                ret = (len > 0 && SendRawAsync(buf, len) == ESP_OK) ? ESP_OK : ESP_FAIL;
+            }
+            return ret == ESP_OK ? eMessageReceiverResult::OK : eMessageReceiverResult::FOR_ME_BUT_FAILED;
         }
 
         esp_err_t handle_ota_post(httpd_req_t *req)
@@ -937,10 +991,21 @@ namespace webmanager
             return ESP_OK;
         }
 
+        // Konstantzeitiger Vergleich (Laenge zuerst, dann XOR-Akkumulation ohne Early-Exit) --
+        // ersetzt den vormaligen std::string==-Vergleich, der bei einem Zeichen-Mismatch frueh
+        // abbricht und damit ein Timing-Seitenkanal ist. Kein externes Krypto-Lib noetig.
+        static bool constant_time_equals(const std::string &a, const std::string &b)
+        {
+            if (a.size() != b.size()) return false;
+            unsigned char diff = 0;
+            for (size_t i = 0; i < a.size(); i++) diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+            return diff == 0;
+        }
+
         bool validate_credentials(const char *username, const char *password)
         {
             if (!username || !password) return false;
-            return (auth_username == username) && (auth_password == password);
+            return constant_time_equals(auth_username, username) && constant_time_equals(auth_password, password);
         }
 
         std::string generate_random_token()
@@ -1078,13 +1143,19 @@ namespace webmanager
                 ESP_LOGI(TAG, "Login successful for user '%s'", username);
                 create_session(username);
                 
-                // Set cookie with session token
-                char cookie_header[256];
-                snprintf(cookie_header, sizeof(cookie_header), 
-                    "Set-Cookie: session=%s; Path=/; HttpOnly; SameSite=Strict\r\n"
-                    "Set-Cookie: username=%s; Path=/; SameSite=Strict", 
-                    session_token.c_str(), username);
-                httpd_resp_set_hdr(req, "Set-Cookie", cookie_header);
+                // Set cookies with session token -- zwei separate Set-Cookie-Header (ein Aufruf
+                // von httpd_resp_set_hdr PRO Cookie), statt (wie zuvor) beide Cookies in EINEN
+                // Header-Wert zu packen, der selbst schon einen literalen "Set-Cookie: "-Praefix
+                // und ein eingebettetes "\r\n" enthielt -- das war kein valides HTTP (ein
+                // Header-Wert darf keinen zweiten Header-Namen + Zeilenumbruch enthalten).
+                char session_cookie[128];
+                snprintf(session_cookie, sizeof(session_cookie),
+                    "session=%s; Path=/; HttpOnly; SameSite=Strict", session_token.c_str());
+                httpd_resp_set_hdr(req, "Set-Cookie", session_cookie);
+                char username_cookie[128];
+                snprintf(username_cookie, sizeof(username_cookie),
+                    "username=%s; Path=/; SameSite=Strict", username);
+                httpd_resp_set_hdr(req, "Set-Cookie", username_cookie);
                 httpd_resp_set_status(req, "303 See Other");
                 httpd_resp_set_hdr(req, "Location", "/");
                 httpd_resp_sendstr(req, "");
@@ -1185,13 +1256,13 @@ namespace webmanager
             return seconds_epoch > 1684412222; // epoch time when this code has been written
         }
 
-        esp_err_t WrapAndSendAsync(uint32_t ns, ::flatbuffers::FlatBufferBuilder &b) override
+        esp_err_t SendRawAsync(const uint8_t* data, size_t len) override
         {
             if (!http_server)
                 return ESP_FAIL;
             if (websocket_file_descriptor == -1)
                 return ESP_ERR_INVALID_STATE;
-            auto *a = new AsyncResponse(ns, &b);
+            auto *a = new AsyncResponse(data, len);
             esp_err_t ret = httpd_queue_work(http_server, M::ws_async_send, a);
             if (ret != ESP_OK)
             {
@@ -1264,10 +1335,11 @@ namespace webmanager
 
 
 
-        esp_err_t Begin(const char *accessPointSsid, const char *accessPointPassword, const char *hostname, bool resetStoredWifiConnection, std::vector<iWebmanagerPlugin *> *plugins, bool init_netif_and_create_event_loop = true, bool startOwnSupervisorTask=true, esp_log_level_t wifiLogLevel=ESP_LOG_WARN, const char *auth_username_param="admin", const char *auth_password_param="password")
+        esp_err_t Begin(const char *accessPointSsid, const char *accessPointPassword, const char *hostname, bool resetStoredWifiConnection, std::vector<iWebmanagerPlugin *> *plugins, bool init_netif_and_create_event_loop = true, bool startOwnSupervisorTask=true, esp_log_level_t wifiLogLevel=ESP_LOG_WARN, const char *auth_username_param="admin", const char *auth_password_param="password", time_t apFallbackTimeout_us_param=FAR_FUTURE)
         {
             ESP_LOGI(TAG, "Stating Webmanager");
-            
+            this->apFallbackTimeout_us = apFallbackTimeout_us_param;
+
             this->hostname=hostname;
             this->auth_username=auth_username_param;
             this->auth_password=auth_password_param;
@@ -1364,7 +1436,8 @@ namespace webmanager
                 // auf keinen Fall einen AccessPoint aufmachen
                 ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
                 ESP_ERROR_CHECK(esp_wifi_start());
-                connectAsSTA(now_us, RECONNECTS_ON_STARTUP);
+                giveUpAt_us = now_us + apFallbackTimeout_us;
+                connectAsSTA(now_us);
                 this->setStatus(WorkingState::KEEP_CONNECTION, now_us + COMMON_TIMEOUT_US);
             }
             ESP_ERROR_CHECK(esp_wifi_start());
@@ -1408,7 +1481,7 @@ namespace webmanager
                tTimeout_us/1000
                );
             if(now_us>tReconnect_us){
-                connectAsSTA(now_us, remainingAttempsToConnectAsSTA-1);
+                connectAsSTA(now_us);
             }
             if(now_us>tShutdownAp_us){
                 wifi_mode_t mode;
