@@ -596,7 +596,7 @@ namespace webmanager
                 return eMessageReceiverResult::FOR_ME_BUT_FAILED;
             lastWifiConnectRequestId = req.requestId;
 
-            esp_err_t ret{ESP_OK};
+            [[maybe_unused]] esp_err_t ret{ESP_OK}; // von ESP_GOTO_ON_FALSE unten benoetigt (schreibt "ret = err_code"), Wert wird aber nie gelesen
             time_t now_us{0};
             size_t len{0};
             len = strlen(req.ssid);
