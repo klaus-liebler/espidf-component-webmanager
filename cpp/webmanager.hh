@@ -1,6 +1,8 @@
 #pragma once
 #include <sdkconfig.h>
 #include <cstring>
+#include <cctype>
+#include <cstdlib>
 #include <ctime>
 #include <algorithm>
 #include <vector>
@@ -180,7 +182,12 @@ namespace webmanager
             resp.rssi = 0;
             uint8_t buf[256];
             size_t len = WsProtocol::wifimanager::ResponseWifiConnect::Encode(resp, buf, sizeof(buf));
-            if (len > 0) SendRawAsync(buf, len);
+            ESP_LOGI(TAG, "sendWifiConnectionNotSuccessfulMessage: requestId=%d, encoded len=%d, fd=%d", (int)resp.requestId, (int)len, (int)websocket_file_descriptor);
+            if (len > 0)
+            {
+                esp_err_t ret = SendRawAsync(buf, len);
+                if (ret != ESP_OK) ESP_LOGW(TAG, "sendWifiConnectionNotSuccessfulMessage: SendRawAsync failed with %s", esp_err_to_name(ret));
+            }
         }
 
         void sendWifiConnectionSuccessfulMessage(const esp_netif_ip_info_t *ip){
@@ -199,7 +206,12 @@ namespace webmanager
             resp.rssi = ap.rssi;
             uint8_t buf[256];
             size_t len = WsProtocol::wifimanager::ResponseWifiConnect::Encode(resp, buf, sizeof(buf));
-            if (len > 0) SendRawAsync(buf, len);
+            ESP_LOGI(TAG, "sendWifiConnectionSuccessfulMessage: requestId=%d, ssid='%s', ip=%s, encoded len=%d, fd=%d", (int)resp.requestId, resp.ssid, ip4addr_ntoa((const ip4_addr_t*)&ip->ip), (int)len, (int)websocket_file_descriptor);
+            if (len > 0)
+            {
+                esp_err_t ret = SendRawAsync(buf, len);
+                if (ret != ESP_OK) ESP_LOGW(TAG, "sendWifiConnectionSuccessfulMessage: SendRawAsync failed with %s", esp_err_to_name(ret));
+            }
         }
 
         esp_err_t delete_sta_config()
@@ -493,7 +505,7 @@ namespace webmanager
                     return ESP_FAIL;
                 }
                 
-                ESP_LOGI(TAG, "WebSocket connection authenticated and opened");
+                ESP_LOGI(TAG, "WebSocket connection authenticated and opened (fd=%d)", (int)httpd_req_to_sockfd(req));
                 return ESP_OK;
             }
 
@@ -1008,6 +1020,37 @@ namespace webmanager
             return constant_time_equals(auth_username, username) && constant_time_equals(auth_password, password);
         }
 
+        // Dekodiert application/x-www-form-urlencoded-Text in-place (Standard-Kodierung eines
+        // <form method='POST'>-Submits ohne enctype-Angabe): '+' -> Leerzeichen, '%XX' -> Byte XX.
+        // Fehlte bisher komplett in handle_login_post() -- Benutzername/Passwort mit Sonderzeichen
+        // (Leerzeichen, '&', '=', Nicht-ASCII wie Umlaute) kamen dadurch percent-kodiert im
+        // Rohtext an und matchten nie gegen den echten (dekodierten) gespeicherten Wert. Reine
+        // ASCII-Buchstaben/Ziffern sind vom Encoding nicht betroffen, das hat den Bug lange
+        // verdeckt (s. Log in handle_login_post).
+        static void url_decode(char *s)
+        {
+            char *dst = s;
+            while (*s)
+            {
+                if (*s == '+')
+                {
+                    *dst++ = ' ';
+                    s++;
+                }
+                else if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2]))
+                {
+                    char hex[3] = {s[1], s[2], 0};
+                    *dst++ = (char)strtol(hex, nullptr, 16);
+                    s += 3;
+                }
+                else
+                {
+                    *dst++ = *s++;
+                }
+            }
+            *dst = '\0';
+        }
+
         std::string generate_random_token()
         {
             char token[33];
@@ -1061,6 +1104,25 @@ namespace webmanager
             ESP_LOGI(TAG, "Session invalidated");
         }
 
+        // Client kann das "session"-Cookie NICHT selbst per document.cookie loeschen, weil es
+        // HttpOnly gesetzt ist (bewusst, s. handle_login_post -- schuetzt vor Diebstahl per XSS) --
+        // das war bislang der einzige Ort, an dem "abgemeldet" versucht wurde (rein clientseitig,
+        // s. app_controller.ts), wirkungslos: das Cookie blieb gueltig, ein Reload auf "/" zeigte
+        // wieder die (weiterhin authentifizierte) SPA statt der Login-Maske. Einziger Weg, ein
+        // HttpOnly-Cookie zu loeschen: der Server selbst schickt ein neues Set-Cookie mit
+        // abgelaufenem Datum.
+        esp_err_t handle_logout_post(httpd_req_t *req)
+        {
+            ESP_LOGI(TAG, "Logout requested");
+            invalidate_session();
+            httpd_resp_set_hdr(req, "Set-Cookie", "session=; Path=/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+            httpd_resp_set_hdr(req, "Set-Cookie", "username=; Path=/; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+            httpd_resp_set_status(req, "303 See Other");
+            httpd_resp_set_hdr(req, "Location", "/");
+            httpd_resp_sendstr(req, "");
+            return ESP_OK;
+        }
+
         esp_err_t handle_login_form(httpd_req_t *req)
         {
             const char *html = 
@@ -1094,11 +1156,11 @@ namespace webmanager
                 "<form method='POST' action='/login'>"
                 "<div class='form-group'>"
                 "<label for='username'>Benutzername:</label>"
-                "<input type='text' id='username' name='username' required autofocus>"
+                "<input type='text' id='username' name='username' autocomplete='username' required autofocus>"
                 "</div>"
                 "<div class='form-group'>"
                 "<label for='password'>Kennwort:</label>"
-                "<input type='password' id='password' name='password' required>"
+                "<input type='password' id='password' name='password' autocomplete='current-password' required>"
                 "</div>"
                 "<button type='submit'>Anmelden</button>"
                 "</form>"
@@ -1137,6 +1199,9 @@ namespace webmanager
 
             sscanf(user_ptr, "%63[^&]", username);
             sscanf(pass_ptr, "%63[^&]", password);
+            url_decode(username);
+            url_decode(password);
+            ESP_LOGI(TAG, "Login attempt for user '%s' (password length %d after url-decode)", username, (int)strlen(password));
 
             // Validate credentials
             if (validate_credentials(username, password)) {
@@ -1261,11 +1326,15 @@ namespace webmanager
             if (!http_server)
                 return ESP_FAIL;
             if (websocket_file_descriptor == -1)
+            {
+                ESP_LOGD(TAG, "SendRawAsync: no active websocket connection (fd==-1), dropping %d bytes", (int)len);
                 return ESP_ERR_INVALID_STATE;
+            }
             auto *a = new AsyncResponse(data, len);
             esp_err_t ret = httpd_queue_work(http_server, M::ws_async_send, a);
             if (ret != ESP_OK)
             {
+                ESP_LOGW(TAG, "SendRawAsync: httpd_queue_work failed with %s (fd=%d)", esp_err_to_name(ret), (int)websocket_file_descriptor);
                 delete (a);
                 if (ret == ESP_ERR_INVALID_ARG || ret == ESP_FAIL)
                 {
@@ -1316,7 +1385,15 @@ namespace webmanager
                 { return static_cast<M *>(req->user_ctx)->handle_login_post(req); },
                 this, false, false, nullptr};
             ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &login_post));
-            
+
+            httpd_uri_t logout_post = {
+                "/logout",
+                HTTP_POST,
+                [](httpd_req_t *req)
+                { return static_cast<M *>(req->user_ctx)->handle_logout_post(req); },
+                this, false, false, nullptr};
+            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &logout_post));
+
             httpd_uri_t webmanager_ws = {
                 "/webmanager_ws",
                 HTTP_GET,
