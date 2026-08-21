@@ -186,7 +186,12 @@ namespace webmanager
             if (len > 0)
             {
                 esp_err_t ret = SendRawAsync(buf, len);
-                if (ret != ESP_OK) ESP_LOGW(TAG, "sendWifiConnectionNotSuccessfulMessage: SendRawAsync failed with %s", esp_err_to_name(ret));
+                // ESP_ERR_INVALID_STATE = kein Websocket-Client verbunden -- passiert erwartbar bei
+                // jedem Boot-Zeit-Autoreconnect zu einer gespeicherten SSID (KEEP_CONNECTION), noch
+                // bevor ueberhaupt ein Browser die Seite geoeffnet hat. Nur andere Fehler sind
+                // tatsaechlich ungewoehnlich.
+                if (ret == ESP_ERR_INVALID_STATE) ESP_LOGD(TAG, "sendWifiConnectionNotSuccessfulMessage: no websocket client connected (yet)");
+                else if (ret != ESP_OK) ESP_LOGW(TAG, "sendWifiConnectionNotSuccessfulMessage: SendRawAsync failed with %s", esp_err_to_name(ret));
             }
         }
 
@@ -210,7 +215,12 @@ namespace webmanager
             if (len > 0)
             {
                 esp_err_t ret = SendRawAsync(buf, len);
-                if (ret != ESP_OK) ESP_LOGW(TAG, "sendWifiConnectionSuccessfulMessage: SendRawAsync failed with %s", esp_err_to_name(ret));
+                // ESP_ERR_INVALID_STATE = kein Websocket-Client verbunden -- passiert erwartbar bei
+                // jedem Boot-Zeit-Autoreconnect zu einer gespeicherten SSID (KEEP_CONNECTION), noch
+                // bevor ueberhaupt ein Browser die Seite geoeffnet hat. Nur andere Fehler sind
+                // tatsaechlich ungewoehnlich.
+                if (ret == ESP_ERR_INVALID_STATE) ESP_LOGD(TAG, "sendWifiConnectionSuccessfulMessage: no websocket client connected (yet)");
+                else if (ret != ESP_OK) ESP_LOGW(TAG, "sendWifiConnectionSuccessfulMessage: SendRawAsync failed with %s", esp_err_to_name(ret));
             }
         }
 
