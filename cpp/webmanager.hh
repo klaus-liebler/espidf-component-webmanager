@@ -36,6 +36,9 @@
 #include <common-esp32.hh>
 #include <esp_log.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <mbedtls/sha256.h>
 #if (CONFIG_HTTPD_MAX_REQ_HDR_LEN < 1024)
 #error "CONFIG_HTTPD_MAX_REQ_HDR_LEN<1024 (Max HTTP Request Header Length)"
 #endif
@@ -77,11 +80,45 @@ namespace webmanager
 
         httpd_handle_t http_server{nullptr};
         int websocket_file_descriptor{-1};
-        std::string auth_username{""};
-        std::string auth_password{""};
-        std::string session_token{""};
-        time_t session_expiry_us{0};
-        const time_t SESSION_TIMEOUT_US = 3600000000; // 1 hour in microseconds
+        // Aktuell authentifizierter Nutzer der (einzigen) offenen Websocket-Verbindung -- fuer
+        // rollenbasierte Autorisierung durch Plugins/Message-Handler (s. GetCurrentSessionRoles()).
+        std::string current_ws_username{""};
+        uint8_t current_ws_roles{0};
+
+        using Role = WsProtocol::usermanagement::Role;
+
+        // Bootstrap-Zugangsdaten aus Begin(...) -- werden NUR verwendet, um beim allerersten Start
+        // (User-Store unter /spiffs/users/ ist leer) einen einzigen Admin-Nutzer anzulegen. Danach ist
+        // der User-Store (s.u.) die alleinige Quelle der Wahrheit fuer Zugangsdaten.
+        std::string bootstrap_admin_username{""};
+        std::string bootstrap_admin_password{""};
+
+        // Ein serverseitig gehaltener Login-Session-Slot (Opaque-Token-Schema, s.
+        // docs/plan_v2/03-wifimanager-review.md). Mehrere Slots statt vormals nur eines einzigen
+        // globalen Tokens -- ermoeglicht mehreren Nutzern/Browsern gleichzeitig eingeloggt zu sein
+        // (unabhaengig von der Websocket-Verbindung, von der es weiterhin nur eine gleichzeitig aktive
+        // gibt).
+        struct Session
+        {
+            std::string token{""};
+            std::string username{""};
+            uint8_t roles{0};
+            time_t expiry_us{0};
+            bool InUse() const { return !token.empty(); }
+        };
+        Session sessions[MAX_SESSIONS]{};
+
+        // Ein persistierter Nutzerdatensatz (s. best_binary_buffers_schema/usermanagement.cs), im
+        // Arbeitsspeicher entpackt (die vom generierten Decode() gelieferten Payload-Zeiger zeigen in
+        // einen kurzlebigen Lese-Puffer, s. load_user()).
+        struct StoredUser
+        {
+            std::string username{""};
+            std::string salt{""};
+            std::string passwordHash{""};
+            uint8_t roles{0};
+            uint32_t epoch{0};
+        };
 
         // Das ist der Status, der alles beschreiben muss
         WorkingState workingState{WorkingState::AP_STARTED};
@@ -507,15 +544,22 @@ namespace webmanager
             {
                 // Validate session token on WebSocket handshake
                 char cookie_buf[256] = {0};
+                std::string username;
+                uint8_t roles = 0;
                 if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) != ESP_OK ||
-                    !validate_session_token(cookie_buf))
+                    !validate_session_token(cookie_buf, username, roles))
                 {
                     ESP_LOGW(TAG, "WebSocket: No valid session token");
                     httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
                     return ESP_FAIL;
                 }
-                
-                ESP_LOGI(TAG, "WebSocket connection authenticated and opened (fd=%d)", (int)httpd_req_to_sockfd(req));
+
+                // Fuer rollenbasierte Autorisierung durch Plugins/Message-Handler, s.
+                // GetCurrentSessionRoles(). Es gibt ohnehin nur eine gleichzeitig aktive
+                // Websocket-Verbindung (s. websocket_file_descriptor), also genuegt ein einzelnes Feld.
+                current_ws_username = username;
+                current_ws_roles = roles;
+                ESP_LOGI(TAG, "WebSocket connection authenticated as '%s' (roles=0x%02x) and opened (fd=%d)", username.c_str(), roles, (int)httpd_req_to_sockfd(req));
                 return ESP_OK;
             }
 
@@ -1024,10 +1068,211 @@ namespace webmanager
             return diff == 0;
         }
 
-        bool validate_credentials(const char *username, const char *password)
+        // --- Nutzerverwaltung: Passwort-Hashing (salted SHA-256) ---------------------------------------
+
+        static std::string bytes_to_hex(const uint8_t *data, size_t len)
         {
-            if (!username || !password) return false;
-            return constant_time_equals(auth_username, username) && constant_time_equals(auth_password, password);
+            static const char *hexdigits = "0123456789abcdef";
+            std::string out;
+            out.resize(len * 2);
+            for (size_t i = 0; i < len; i++)
+            {
+                out[i * 2] = hexdigits[data[i] >> 4];
+                out[i * 2 + 1] = hexdigits[data[i] & 0x0F];
+            }
+            return out;
+        }
+
+        static std::string generate_salt_hex()
+        {
+            uint8_t salt[16];
+            esp_fill_random(salt, sizeof(salt));
+            return bytes_to_hex(salt, sizeof(salt));
+        }
+
+        // SHA256(salt || password), hex-kodiert. Ein einzelner SHA-256-Durchlauf statt eines
+        // dedizierten Passwort-KDFs (PBKDF2/bcrypt/scrypt/Argon2) -- konsistent mit dem bisherigen
+        // Sicherheitsniveau dieses Moduls (lokaler Access Point, physischer Zugriff fuer einen
+        // Offline-Angriff auf die Datei noetig, s. docs/plan_v2/03-wifimanager-review.md), ohne neue
+        // Abhaengigkeit ueber das bereits eingebundene mbedtls hinaus.
+        static std::string hash_password(const std::string &salt_hex, const char *password)
+        {
+            mbedtls_sha256_context ctx;
+            mbedtls_sha256_init(&ctx);
+            mbedtls_sha256_starts(&ctx, 0);
+            mbedtls_sha256_update(&ctx, (const uint8_t *)salt_hex.data(), salt_hex.size());
+            mbedtls_sha256_update(&ctx, (const uint8_t *)password, strlen(password));
+            uint8_t digest[32];
+            mbedtls_sha256_finish(&ctx, digest);
+            mbedtls_sha256_free(&ctx);
+            return bytes_to_hex(digest, sizeof(digest));
+        }
+
+        // --- Nutzerverwaltung: Ablage als eine Datei pro Nutzer unter /spiffs/users/ --------------------
+        // (s. Kommentar in best_binary_buffers_schema/usermanagement.cs, warum kein Array-Container-Typ)
+
+        // Nur alphanumerisch/'_'/'-' -- verhindert Path-Traversal (kein '/', kein '.') beim Aufbau des
+        // Dateipfads aus einem (potenziell von aussen kommenden, s. Login/Admin-Endpunkte) Benutzernamen.
+        static bool is_valid_username(const char *username)
+        {
+            size_t len = username ? strlen(username) : 0;
+            if (len == 0 || len > 32) return false;
+            for (size_t i = 0; i < len; i++)
+            {
+                char c = username[i];
+                if (!isalnum((unsigned char)c) && c != '_' && c != '-') return false;
+            }
+            return true;
+        }
+
+        static std::string user_file_path(const std::string &username)
+        {
+            return std::string("/spiffs/users/") + username + ".bin";
+        }
+
+        bool load_user(const std::string &username, StoredUser &out)
+        {
+            if (!is_valid_username(username.c_str())) return false;
+            FILE *f = fopen(user_file_path(username).c_str(), "rb");
+            if (!f) return false;
+            uint8_t buf[512];
+            size_t len = fread(buf, 1, sizeof(buf), f);
+            fclose(f);
+            if (len < 4) return false;
+            uint16_t nsId = (uint16_t)(buf[0] | (buf[1] << 8));
+            uint16_t typeId = (uint16_t)(buf[2] | (buf[3] << 8));
+            if (nsId != WsProtocol::usermanagement::NAMESPACE_ID || typeId != WsProtocol::usermanagement::UserRecord::TYPE_ID)
+            {
+                ESP_LOGE(TAG, "load_user('%s'): unexpected file header, ignoring (corrupt or wrong schema version?)", username.c_str());
+                return false;
+            }
+            WsProtocol::usermanagement::UserRecord::Payload payload{};
+            if (!WsProtocol::usermanagement::UserRecord::Decode(buf, len, payload)) return false;
+            out.username = payload.username;
+            out.salt = payload.salt;
+            out.passwordHash = payload.passwordHash;
+            out.roles = payload.roles;
+            out.epoch = payload.epoch;
+            return true;
+        }
+
+        bool save_user(const StoredUser &user)
+        {
+            if (!is_valid_username(user.username.c_str())) return false;
+            mkdir("/spiffs/users", 0777); // Fehler (z.B. existiert bereits) bewusst ignoriert
+            WsProtocol::usermanagement::UserRecord::Payload payload{};
+            payload.username = user.username.c_str();
+            payload.salt = user.salt.c_str();
+            payload.passwordHash = user.passwordHash.c_str();
+            payload.roles = user.roles;
+            payload.epoch = user.epoch;
+            uint8_t buf[512];
+            size_t written = WsProtocol::usermanagement::UserRecord::Encode(payload, buf, sizeof(buf));
+            if (written == 0)
+            {
+                ESP_LOGE(TAG, "save_user('%s'): encoded record too large for buffer", user.username.c_str());
+                return false;
+            }
+            FILE *f = fopen(user_file_path(user.username).c_str(), "wb");
+            if (!f) return false;
+            size_t ret = fwrite(buf, 1, written, f);
+            fclose(f);
+            return ret == written;
+        }
+
+        bool delete_user(const std::string &username)
+        {
+            if (!is_valid_username(username.c_str())) return false;
+            return unlink(user_file_path(username).c_str()) == 0;
+        }
+
+        std::vector<std::string> list_usernames()
+        {
+            std::vector<std::string> result;
+            DIR *dir = opendir("/spiffs/users");
+            if (!dir) return result;
+            struct dirent *entry;
+            const std::string suffix = ".bin";
+            while ((entry = readdir(dir)) != nullptr)
+            {
+                if (entry->d_type == DT_DIR) continue;
+                std::string name(entry->d_name);
+                if (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+                    result.push_back(name.substr(0, name.size() - suffix.size()));
+            }
+            closedir(dir);
+            return result;
+        }
+
+        bool user_store_is_empty()
+        {
+            DIR *dir = opendir("/spiffs/users");
+            if (!dir) return true;
+            struct dirent *entry;
+            bool empty = true;
+            while ((entry = readdir(dir)) != nullptr)
+            {
+                if (entry->d_type == DT_DIR) continue;
+                empty = false;
+                break;
+            }
+            closedir(dir);
+            return empty;
+        }
+
+        int count_admins()
+        {
+            int count = 0;
+            for (auto &name : list_usernames())
+            {
+                StoredUser u;
+                if (load_user(name, u) && (u.roles & (uint8_t)Role::Admin)) count++;
+            }
+            return count;
+        }
+
+        void bootstrap_default_admin_if_user_store_empty()
+        {
+            if (!user_store_is_empty()) return;
+            ESP_LOGW(TAG, "No users found in user store -- creating default admin user '%s' from Begin()-parameters. Change this password after first login!", bootstrap_admin_username.c_str());
+            StoredUser admin;
+            admin.username = bootstrap_admin_username;
+            admin.salt = generate_salt_hex();
+            admin.passwordHash = hash_password(admin.salt, bootstrap_admin_password.c_str());
+            admin.roles = (uint8_t)Role::Admin;
+            admin.epoch = 0;
+            if (!save_user(admin))
+                ESP_LOGE(TAG, "Failed to persist default admin user!");
+        }
+
+        static uint8_t parse_roles_csv(const char *roles_str)
+        {
+            if (!roles_str || roles_str[0] == 0) return (uint8_t)Role::Viewer;
+            uint8_t roles = 0;
+            std::string s(roles_str);
+            size_t start = 0;
+            while (start <= s.size())
+            {
+                size_t comma = s.find(',', start);
+                std::string token = s.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (token == "Admin") roles |= (uint8_t)Role::Admin;
+                else if (token == "Operator") roles |= (uint8_t)Role::Operator;
+                else if (token == "Viewer") roles |= (uint8_t)Role::Viewer;
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+            return roles == 0 ? (uint8_t)Role::Viewer : roles;
+        }
+
+        bool validate_credentials_and_load(const char *username, const char *password, StoredUser &outUser)
+        {
+            if (!username || !password || !is_valid_username(username)) return false;
+            StoredUser user;
+            if (!load_user(username, user)) return false;
+            std::string computedHash = hash_password(user.salt, password);
+            if (!constant_time_equals(computedHash, user.passwordHash)) return false;
+            outUser = user;
+            return true;
         }
 
         // Dekodiert application/x-www-form-urlencoded-Text in-place (Standard-Kodierung eines
@@ -1061,12 +1306,12 @@ namespace webmanager
             *dst = '\0';
         }
 
-        std::string generate_random_token()
+        static std::string generate_random_token()
         {
             char token[33];
             uint8_t random_bytes[16];
             esp_fill_random(random_bytes, sizeof(random_bytes));
-            
+
             for (int i = 0; i < 16; i++) {
                 snprintf(&token[i*2], 3, "%02x", random_bytes[i]);
             }
@@ -1074,44 +1319,131 @@ namespace webmanager
             return std::string(token);
         }
 
-        bool create_session(const char *username)
+        // Legt einen neuen Session-Slot fuer 'user' an (verdraengt bei vollem Session-Array den Slot mit
+        // der aeltesten Ablaufzeit -- ausreichend fuer die erwartete Nutzerzahl dieses Geraets, kein
+        // Grund fuer eine dynamische Datenstruktur).
+        std::string create_session(const StoredUser &user)
         {
             xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
-            session_token = generate_random_token();
-            session_expiry_us = esp_timer_get_time() + SESSION_TIMEOUT_US;
+            int slot = -1;
+            for (size_t i = 0; i < MAX_SESSIONS; i++)
+                if (!sessions[i].InUse()) { slot = (int)i; break; }
+            if (slot == -1)
+            {
+                size_t oldest = 0;
+                for (size_t i = 1; i < MAX_SESSIONS; i++)
+                    if (sessions[i].expiry_us < sessions[oldest].expiry_us) oldest = i;
+                slot = (int)oldest;
+            }
+            sessions[slot].token = generate_random_token();
+            sessions[slot].username = user.username;
+            sessions[slot].roles = user.roles;
+            sessions[slot].expiry_us = esp_timer_get_time() + SESSION_MAX_AGE_US;
+            std::string token = sessions[slot].token;
             xSemaphoreGive(webmanager_semaphore);
-            ESP_LOGI(TAG, "Session created for user '%s', token expires in 1 hour", username);
-            return true;
+            ESP_LOGI(TAG, "Session created for user '%s' (roles=0x%02x)", user.username.c_str(), user.roles);
+            return token;
         }
 
-        bool validate_session_token(const char *cookie_header)
+        static bool extract_session_token(const char *cookie_header, char (&out_token_buf)[33])
         {
+            out_token_buf[0] = 0;
             if (!cookie_header) return false;
-            
-            char token_buf[33] = {0};
             const char *session_cookie = strstr(cookie_header, "session=");
             if (!session_cookie) return false;
-            
             session_cookie += 8; // strlen("session=")
-            sscanf(session_cookie, "%32s", token_buf);
-            
+            sscanf(session_cookie, "%32s", out_token_buf);
+            return out_token_buf[0] != 0;
+        }
+
+        // Bei Erfolg: outUsername/outRoles befuellt UND die serverseitige Ablaufzeit des Slots wird
+        // verlaengert ("sliding renewal", s. SESSION_MAX_AGE_US) -- Aufrufer, die den Browser ebenfalls
+        // laenger eingeloggt halten wollen, muessen zusaetzlich ein frisches Set-Cookie schicken (s.
+        // set_session_cookies(), aufgerufen von handle_webmanager_get()/handle_login_post()).
+        bool validate_session_token(const char *cookie_header, std::string &outUsername, uint8_t &outRoles)
+        {
+            char token_buf[33];
+            if (!extract_session_token(cookie_header, token_buf)) return false;
+
             xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
             time_t now = esp_timer_get_time();
-            bool valid = (!session_token.empty() && 
-                         session_token == token_buf && 
-                         now < session_expiry_us);
+            bool valid = false;
+            for (size_t i = 0; i < MAX_SESSIONS; i++)
+            {
+                if (sessions[i].InUse() && sessions[i].token == token_buf && now < sessions[i].expiry_us)
+                {
+                    outUsername = sessions[i].username;
+                    outRoles = sessions[i].roles;
+                    sessions[i].expiry_us = now + SESSION_MAX_AGE_US;
+                    valid = true;
+                    break;
+                }
+            }
             xSemaphoreGive(webmanager_semaphore);
-            
             return valid;
         }
 
-        void invalidate_session()
+        void invalidate_session_by_token(const char *token)
         {
+            if (!token || !token[0]) return;
             xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
-            session_token.clear();
-            session_expiry_us = 0;
+            for (size_t i = 0; i < MAX_SESSIONS; i++)
+                if (sessions[i].InUse() && sessions[i].token == token) sessions[i].token.clear();
             xSemaphoreGive(webmanager_semaphore);
             ESP_LOGI(TAG, "Session invalidated");
+        }
+
+        // Fuer sofortigen Widerruf bei Passwortaenderung/Loeschen eines Nutzers ("ueberall abmelden") --
+        // ohne dafuer bei jeder Session-Validierung zusaetzlich die Nutzerdatei erneut von der SPIFFS-
+        // Partition lesen zu muessen (s. Kommentar bei UserRecord.Epoch im Schema).
+        void invalidate_all_sessions_for_user(const std::string &username)
+        {
+            xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
+            for (size_t i = 0; i < MAX_SESSIONS; i++)
+                if (sessions[i].InUse() && sessions[i].username == username) sessions[i].token.clear();
+            xSemaphoreGive(webmanager_semaphore);
+        }
+
+        // Setzt/erneuert beide Cookies mit einer an SESSION_MAX_AGE_US gekoppelten Lebensdauer, sodass
+        // der Browser den Login geraeteuebergreifend merkt und beim naechsten Besuch automatisch (ohne
+        // erneute Passwortabfrage) wieder anmeldet, solange das Cookie nicht abgelaufen ist. 'Secure'
+        // ist unbedenklich, da dieser Server ausschliesslich ueber HTTPS erreichbar ist (s. main.cc).
+        void set_session_cookies(httpd_req_t *req, const std::string &token, const std::string &username)
+        {
+            long long maxAgeSeconds = (long long)(SESSION_MAX_AGE_US / 1000000);
+            char session_cookie[160];
+            snprintf(session_cookie, sizeof(session_cookie),
+                "session=%s; Path=/; Max-Age=%lld; HttpOnly; Secure; SameSite=Strict", token.c_str(), maxAgeSeconds);
+            httpd_resp_set_hdr(req, "Set-Cookie", session_cookie);
+            char username_cookie[160];
+            snprintf(username_cookie, sizeof(username_cookie),
+                "username=%s; Path=/; Max-Age=%lld; Secure; SameSite=Strict", username.c_str(), maxAgeSeconds);
+            httpd_resp_set_hdr(req, "Set-Cookie", username_cookie);
+        }
+
+        // Fuer Admin-only-Endpunkte: liest+validiert das Session-Cookie und prueft, ob die Rolle gesetzt
+        // ist; schreibt bei Misserfolg selbst eine 401/403-Antwort. Rueckgabewert false => Aufrufer muss
+        // sofort ESP_FAIL zurueckgeben, Response ist bereits versendet. outUsername ist der zur
+        // validierten Session gehoerende Nutzername (fuer Audit-Logging in den Aufrufern) -- ABSICHTLICH
+        // NICHT GetCurrentSessionUsername() (das ist der Nutzer der aktuell offenen Websocket-
+        // Verbindung, die von diesem HTTP-Request unabhaengig ist).
+        bool require_role(httpd_req_t *req, Role required, std::string &outUsername)
+        {
+            char cookie_buf[256] = {0};
+            uint8_t roles = 0;
+            if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) != ESP_OK ||
+                !validate_session_token(cookie_buf, outUsername, roles))
+            {
+                httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
+                return false;
+            }
+            if (!(roles & (uint8_t)required))
+            {
+                ESP_LOGW(TAG, "User '%s' (roles=0x%02x) lacks required role 0x%02x", outUsername.c_str(), roles, (uint8_t)required);
+                httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Forbidden");
+                return false;
+            }
+            return true;
         }
 
         // Client kann das "session"-Cookie NICHT selbst per document.cookie loeschen, weil es
@@ -1124,12 +1456,116 @@ namespace webmanager
         esp_err_t handle_logout_post(httpd_req_t *req)
         {
             ESP_LOGI(TAG, "Logout requested");
-            invalidate_session();
-            httpd_resp_set_hdr(req, "Set-Cookie", "session=; Path=/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
-            httpd_resp_set_hdr(req, "Set-Cookie", "username=; Path=/; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+            char cookie_buf[256] = {0};
+            if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK)
+            {
+                char token_buf[33];
+                if (extract_session_token(cookie_buf, token_buf)) invalidate_session_by_token(token_buf);
+            }
+            httpd_resp_set_hdr(req, "Set-Cookie", "session=; Path=/; HttpOnly; Secure; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+            httpd_resp_set_hdr(req, "Set-Cookie", "username=; Path=/; Secure; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
             httpd_resp_set_status(req, "303 See Other");
             httpd_resp_set_hdr(req, "Location", "/");
             httpd_resp_sendstr(req, "");
+            return ESP_OK;
+        }
+
+        // --- Admin-only Nutzerverwaltung (Role::Admin) -----------------------------------------------
+        // Bewusst schlicht (text/plain, kein JSON-Parser im Projekt, form-urlencoded wie /login) statt
+        // einer grafischen Oberflaeche -- kann bei Bedarf spaeter um eine SPA-Seite ergaenzt werden.
+
+        esp_err_t handle_admin_users_get(httpd_req_t *req)
+        {
+            std::string adminUsername;
+            if (!require_role(req, Role::Admin, adminUsername)) return ESP_FAIL;
+            httpd_resp_set_type(req, "text/plain; charset=utf-8");
+            for (auto &name : list_usernames())
+            {
+                StoredUser u;
+                if (!load_user(name, u)) continue;
+                char line[128];
+                snprintf(line, sizeof(line), "%s\troles=0x%02x\n", u.username.c_str(), u.roles);
+                httpd_resp_sendstr_chunk(req, line);
+            }
+            httpd_resp_sendstr_chunk(req, nullptr);
+            return ESP_OK;
+        }
+
+        // Legt einen Nutzer an oder aktualisiert ihn (Passwort + Rollen werden dabei immer komplett
+        // ersetzt). Formular-Felder wie bei /login: username, password, roles (kommasepariert aus
+        // Admin/Operator/Viewer, z.B. "Admin,Operator"; leer/fehlend => Viewer).
+        esp_err_t handle_admin_users_post(httpd_req_t *req)
+        {
+            std::string adminUsername;
+            if (!require_role(req, Role::Admin, adminUsername)) return ESP_FAIL;
+
+            char buf[256] = {0};
+            size_t recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+            if (recv_len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request"); return ESP_FAIL; }
+
+            char username[64] = {0}, password[64] = {0}, roles_str[64] = {0};
+            char *user_ptr = strstr(buf, "username=");
+            char *pass_ptr = strstr(buf, "password=");
+            char *roles_ptr = strstr(buf, "roles=");
+            if (!user_ptr || !pass_ptr) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing username/password"); return ESP_FAIL; }
+            user_ptr += 9; pass_ptr += 9;
+            sscanf(user_ptr, "%63[^&]", username);
+            sscanf(pass_ptr, "%63[^&]", password);
+            url_decode(username);
+            url_decode(password);
+            if (roles_ptr) { roles_ptr += 6; sscanf(roles_ptr, "%63[^&]", roles_str); url_decode(roles_str); }
+
+            if (!is_valid_username(username)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid username (only a-zA-Z0-9_- allowed)"); return ESP_FAIL; }
+            if (strlen(password) < 8) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password too short (min. 8 characters)"); return ESP_FAIL; }
+
+            uint8_t roles = parse_roles_csv(roles_str);
+
+            StoredUser existing;
+            bool existed = load_user(username, existing);
+            if (existed && (existing.roles & (uint8_t)Role::Admin) && !(roles & (uint8_t)Role::Admin) && count_admins() <= 1)
+            {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Cannot remove the Admin role from the last remaining admin user");
+                return ESP_FAIL;
+            }
+
+            StoredUser user;
+            user.username = username;
+            user.salt = generate_salt_hex();
+            user.passwordHash = hash_password(user.salt, password);
+            user.roles = roles;
+            user.epoch = existed ? existing.epoch + 1 : 0;
+            if (!save_user(user)) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save user"); return ESP_FAIL; }
+            if (existed) invalidate_all_sessions_for_user(username); // Passwort/Rollen geaendert -> bestehende Sessions dieses Nutzers verwerfen
+            ESP_LOGI(TAG, "Admin '%s': user '%s' %s (roles=0x%02x)", adminUsername.c_str(), username, existed ? "updated" : "created", roles);
+            httpd_resp_sendstr(req, "OK");
+            return ESP_OK;
+        }
+
+        esp_err_t handle_admin_users_delete_post(httpd_req_t *req)
+        {
+            std::string adminUsername;
+            if (!require_role(req, Role::Admin, adminUsername)) return ESP_FAIL;
+
+            char buf[128] = {0};
+            size_t recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+            if (recv_len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request"); return ESP_FAIL; }
+            char username[64] = {0};
+            char *user_ptr = strstr(buf, "username=");
+            if (!user_ptr) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing username"); return ESP_FAIL; }
+            user_ptr += 9;
+            sscanf(user_ptr, "%63[^&]", username);
+            url_decode(username);
+
+            StoredUser target;
+            if (load_user(username, target) && (target.roles & (uint8_t)Role::Admin) && count_admins() <= 1)
+            {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Cannot delete the last remaining admin user");
+                return ESP_FAIL;
+            }
+            if (!delete_user(username)) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "User not found"); return ESP_FAIL; }
+            invalidate_all_sessions_for_user(username);
+            ESP_LOGI(TAG, "Admin '%s': user '%s' deleted", adminUsername.c_str(), username);
+            httpd_resp_sendstr(req, "OK");
             return ESP_OK;
         }
 
@@ -1213,24 +1649,12 @@ namespace webmanager
             url_decode(password);
             ESP_LOGI(TAG, "Login attempt for user '%s' (password length %d after url-decode)", username, (int)strlen(password));
 
-            // Validate credentials
-            if (validate_credentials(username, password)) {
+            // Validate credentials against the user store (/spiffs/users/<username>.bin)
+            StoredUser user;
+            if (validate_credentials_and_load(username, password, user)) {
                 ESP_LOGI(TAG, "Login successful for user '%s'", username);
-                create_session(username);
-                
-                // Set cookies with session token -- zwei separate Set-Cookie-Header (ein Aufruf
-                // von httpd_resp_set_hdr PRO Cookie), statt (wie zuvor) beide Cookies in EINEN
-                // Header-Wert zu packen, der selbst schon einen literalen "Set-Cookie: "-Praefix
-                // und ein eingebettetes "\r\n" enthielt -- das war kein valides HTTP (ein
-                // Header-Wert darf keinen zweiten Header-Namen + Zeilenumbruch enthalten).
-                char session_cookie[128];
-                snprintf(session_cookie, sizeof(session_cookie),
-                    "session=%s; Path=/; HttpOnly; SameSite=Strict", session_token.c_str());
-                httpd_resp_set_hdr(req, "Set-Cookie", session_cookie);
-                char username_cookie[128];
-                snprintf(username_cookie, sizeof(username_cookie),
-                    "username=%s; Path=/; SameSite=Strict", username);
-                httpd_resp_set_hdr(req, "Set-Cookie", username_cookie);
+                std::string token = create_session(user);
+                set_session_cookies(req, token, user.username);
                 httpd_resp_set_status(req, "303 See Other");
                 httpd_resp_set_hdr(req, "Location", "/");
                 httpd_resp_sendstr(req, "");
@@ -1275,16 +1699,24 @@ namespace webmanager
             char cookie_buf[256] = {0};
             if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK)
             {
-                if (validate_session_token(cookie_buf))
+                std::string username;
+                uint8_t roles = 0;
+                if (validate_session_token(cookie_buf, username, roles))
                 {
-                    ESP_LOGI(TAG, "User authenticated via session token");
+                    ESP_LOGI(TAG, "User '%s' authenticated via session token", username.c_str());
+                    // Sliding renewal: bei jedem Seitenaufruf ein frisches Set-Cookie, damit der Browser
+                    // den Login effektiv dauerhaft merkt, solange er regelmaessig genutzt wird (s.
+                    // set_session_cookies()).
+                    char token_buf[33];
+                    extract_session_token(cookie_buf, token_buf);
+                    set_session_cookies(req, token_buf, username);
                     httpd_resp_set_type(req, "text/html");
                     httpd_resp_set_hdr(req, "Content-Encoding", "br");
                     httpd_resp_send(req, webmanager_html_br_start, webmanager_html_br_length);
                     return ESP_OK;
                 }
             }
-            
+
             // No valid session: show login form
             ESP_LOGI(TAG, "Showing login form (no valid session)");
             return handle_login_form(req);
@@ -1304,6 +1736,12 @@ namespace webmanager
         {
             return this->staConnectionState;
         }
+
+        // Rollen des Nutzers der aktuell offenen Websocket-Verbindung (0, falls keine offen ist) --
+        // fuer Plugins/Message-Handler, die bestimmte Requests auf bestimmte Rollen einschraenken wollen
+        // (z.B. "nur Admin/Operator duerfen schreiben"). Rollen-Bitmaske s. WsProtocol::usermanagement::Role.
+        uint8_t GetCurrentSessionRoles() const { return current_ws_roles; }
+        const std::string &GetCurrentSessionUsername() const { return current_ws_username; }
 
         const char *GetHostname()
         {
@@ -1404,6 +1842,30 @@ namespace webmanager
                 this, false, false, nullptr};
             ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &logout_post));
 
+            httpd_uri_t admin_users_get = {
+                "/admin/users",
+                HTTP_GET,
+                [](httpd_req_t *req)
+                { return static_cast<M *>(req->user_ctx)->handle_admin_users_get(req); },
+                this, false, false, nullptr};
+            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &admin_users_get));
+
+            httpd_uri_t admin_users_post = {
+                "/admin/users",
+                HTTP_POST,
+                [](httpd_req_t *req)
+                { return static_cast<M *>(req->user_ctx)->handle_admin_users_post(req); },
+                this, false, false, nullptr};
+            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &admin_users_post));
+
+            httpd_uri_t admin_users_delete_post = {
+                "/admin/users_delete",
+                HTTP_POST,
+                [](httpd_req_t *req)
+                { return static_cast<M *>(req->user_ctx)->handle_admin_users_delete_post(req); },
+                this, false, false, nullptr};
+            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &admin_users_delete_post));
+
             httpd_uri_t webmanager_ws = {
                 "/webmanager_ws",
                 HTTP_GET,
@@ -1428,9 +1890,10 @@ namespace webmanager
             this->apFallbackTimeout_us = apFallbackTimeout_us_param;
 
             this->hostname=hostname;
-            this->auth_username=auth_username_param;
-            this->auth_password=auth_password_param;
-            
+            this->bootstrap_admin_username=auth_username_param;
+            this->bootstrap_admin_password=auth_password_param;
+            bootstrap_default_admin_if_user_store_empty();
+
             if (strlen(accessPointPassword) < 8 && AP_AUTHMODE != WIFI_AUTH_OPEN){
                 ESP_LOGE(TAG, "Password too short for authentication. Minimal length is 8. Exiting Webmanager");
                 return ESP_FAIL;

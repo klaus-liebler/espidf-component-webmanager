@@ -17,6 +17,13 @@ namespace webmanager{
     constexpr const char* nvs_key_wifi_password{"password"};
     constexpr size_t HTTP_BUFFER_SIZE{2*2048};
     constexpr size_t MAX_FILE_SIZE{256*1024};
+    /* Max. Anzahl gleichzeitig eingeloggter Browser/Sessions (unabhaengig von der Websocket-Verbindung,
+       von der es ohnehin nur eine gleichzeitig aktive gibt, s. websocket_file_descriptor in webmanager.hh) */
+    constexpr size_t MAX_SESSIONS{8};
+    /* Cookie-Lebensdauer bzw. serverseitige Session-Gueltigkeit; wird bei jeder erfolgreichen Validierung
+       (Seitenaufruf, Login) verlaengert ("sliding renewal"), sodass aktive Nutzer effektiv dauerhaft
+       eingeloggt bleiben, ohne sich erneut anmelden zu muessen */
+    constexpr time_t SESSION_MAX_AGE_US{30LL * 24 * 3600 * 1000000};
     /* Max length a file path can have on storage */
     constexpr size_t FILE_PATH_MAX{20+ESP_VFS_PATH_MAX + CONFIG_SPIFFS_OBJ_NAME_LEN};
     constexpr const char* FILES_GLOB{"/files/*"};
