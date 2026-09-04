@@ -16,7 +16,7 @@ public class JournalItem : IJournalItem
 {
 	public ulong LastMessageTimestamp;
 	public uint MessageCode;
-	public string MessageString;
+	[BinaryMaxEncodedByteLength(127)] public string MessageString;
 	public uint MessageData;
 	public uint MessageCount;
 }
@@ -29,5 +29,5 @@ public class RequestJournal
 [BinaryMessage(MessageKind.Response)]
 public class ResponseJournal
 {
-	public IJournalItem[] JournalItems;
+	[BinaryMaxItemCount(32)] public IJournalItem[] JournalItems;
 }

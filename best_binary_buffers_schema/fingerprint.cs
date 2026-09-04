@@ -25,9 +25,11 @@ public interface IFinger
 [BinaryType]
 public class Finger : IFinger
 {
-	public string Name;
+	// 15 = NVS_KEY_NAME_MAX_SIZE(16)-1 -- Name/ScheduleName werden 1:1 als NVS-Keys verwendet
+	// (r503pro_manager.hh: MAX_FINGERNAME_LEN; scheduler.hh: nvs_set_blob(..., req.newName, ...)).
+	[BinaryMaxEncodedByteLength(15)] public string Name;
 	public ushort Index;
-	public string ScheduleName;
+	[BinaryMaxEncodedByteLength(15)] public string ScheduleName;
 	public ushort ActionIndex;
 }
 
@@ -46,7 +48,7 @@ public class ResponseFingerActionManually
 [BinaryMessage(MessageKind.Request)]
 public class RequestEnrollNewFinger
 {
-	public string Name;
+	[BinaryMaxEncodedByteLength(15)] public string Name;
 }
 
 [BinaryMessage(MessageKind.Response)]
@@ -59,7 +61,7 @@ public class ResponseEnrollNewFinger
 [BinaryMessage(MessageKind.Response)]
 public class NotifyEnrollNewFinger
 {
-	public string Name;
+	[BinaryMaxEncodedByteLength(15)] public string Name;
 	public ushort Index;
 	public byte Step;
 	public ushort Errorcode;
@@ -77,14 +79,14 @@ public class NotifyFingerDetected
 [BinaryMessage(MessageKind.Request)]
 public class RequestDeleteFinger
 {
-	public string Name;
+	[BinaryMaxEncodedByteLength(15)] public string Name;
 }
 
 [BinaryMessage(MessageKind.Response)]
 public class ResponseDeleteFinger
 {
 	public ushort Errorcode;
-	public string Name;
+	[BinaryMaxEncodedByteLength(15)] public string Name;
 }
 
 [BinaryMessage(MessageKind.Request)]
@@ -103,7 +105,7 @@ public class ResponseStoreFingerAction
 public class RequestStoreFingerSchedule
 {
 	public ushort FingerIndex;
-	public string ScheduleName;
+	[BinaryMaxEncodedByteLength(15)] public string ScheduleName;
 }
 
 [BinaryMessage(MessageKind.Response)]
@@ -136,8 +138,8 @@ public class ResponseCancelInstruction
 [BinaryMessage(MessageKind.Request)]
 public class RequestRenameFinger
 {
-	public string OldName;
-	public string NewName;
+	[BinaryMaxEncodedByteLength(15)] public string OldName;
+	[BinaryMaxEncodedByteLength(15)] public string NewName;
 }
 
 [BinaryMessage(MessageKind.Response)]
@@ -162,8 +164,8 @@ public class ResponseFingerprintSensorInfo
 	public uint DeviceAddress;
 	public byte DataPacketSizeCode;
 	public byte BaudRateTimes9600;
-	public string AlgVer;
-	public string FwVer;
+	[BinaryMaxEncodedByteLength(15)] public string AlgVer;
+	[BinaryMaxEncodedByteLength(15)] public string FwVer;
 }
 
 [BinaryMessage(MessageKind.Request)]
@@ -174,6 +176,8 @@ public class RequestFingers
 [BinaryMessage(MessageKind.Response)]
 public class ResponseFingers
 {
-	public string[] ScheduleNames;
-	public IFinger[] Fingers;
+	[BinaryMaxItemCount(16)] [BinaryMaxEncodedByteLength(15)] public string[] ScheduleNames;
+	// 200: Kapazitaet des R503(-Pro)-Sensors laut Datenblatt (librarySizeMax, s.
+	// grow_fingerprint_serial_protocol.hh).
+	[BinaryMaxItemCount(200)] public IFinger[] Fingers;
 }

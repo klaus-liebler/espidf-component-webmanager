@@ -7,11 +7,11 @@ namespace chatbot;
 [BinaryMessage(MessageKind.Request)]
 public class RequestChat
 {
-	public string Text;
+	[BinaryMaxEncodedByteLength(255)] public string Text;
 }
 
 [BinaryMessage(MessageKind.Response)]
 public class ResponseChat
 {
-	public string Text;
+	[BinaryMaxEncodedByteLength(511)] public string Text;
 }

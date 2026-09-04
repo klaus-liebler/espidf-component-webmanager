@@ -14,57 +14,61 @@ public interface ISettingWrapper
 {
 }
 
+// 32 = Bound aus usersettings_plugin.hh (Kommentar dort: "settingKey<=32+null", "Wert<=32+null").
 [BinaryType]
 public class StringSettingWrapper : ISettingWrapper
 {
-	public string SettingKey;
-	public string Value;
+	[BinaryMaxEncodedByteLength(32)] public string SettingKey;
+	[BinaryMaxEncodedByteLength(32)] public string Value;
 }
 
 [BinaryType]
 public class IntegerSettingWrapper : ISettingWrapper
 {
-	public string SettingKey;
+	[BinaryMaxEncodedByteLength(32)] public string SettingKey;
 	public int Value;
 }
 
 [BinaryType]
 public class BooleanSettingWrapper : ISettingWrapper
 {
-	public string SettingKey;
+	[BinaryMaxEncodedByteLength(32)] public string SettingKey;
 	public bool Value;
 }
 
 [BinaryType]
 public class EnumSettingWrapper : ISettingWrapper
 {
-	public string SettingKey;
+	[BinaryMaxEncodedByteLength(32)] public string SettingKey;
 	public int Value;
 }
 
 [BinaryMessage(MessageKind.Request)]
 public class RequestGetUserSettings
 {
-	public string GroupKey;
+	// 15 = NVS_KEY_NAME_MAX_SIZE(16)-1 -- groupKey wird 1:1 als NVS-Namespace verwendet
+	// (usersettings_plugin.hh: nvs_open_from_partition(partitionName, group->groupKey, ...)).
+	[BinaryMaxEncodedByteLength(15)] public string GroupKey;
 }
 
 [BinaryMessage(MessageKind.Response)]
 public class ResponseGetUserSettings
 {
-	public string GroupKey;
-	public ISettingWrapper[] Settings;
+	[BinaryMaxEncodedByteLength(15)] public string GroupKey;
+	// 32: passend zu usersettings_plugin.hh's Kommentar "bis zu 32 Settings".
+	[BinaryMaxItemCount(32)] public ISettingWrapper[] Settings;
 }
 
 [BinaryMessage(MessageKind.Request)]
 public class RequestSetUserSettings
 {
-	public string GroupKey;
-	public ISettingWrapper[] Settings;
+	[BinaryMaxEncodedByteLength(15)] public string GroupKey;
+	[BinaryMaxItemCount(32)] public ISettingWrapper[] Settings;
 }
 
 [BinaryMessage(MessageKind.Response)]
 public class ResponseSetUserSettings
 {
-	public string GroupKey;
-	public string[] SettingKeys;
+	[BinaryMaxEncodedByteLength(15)] public string GroupKey;
+	[BinaryMaxItemCount(32)] [BinaryMaxEncodedByteLength(32)] public string[] SettingKeys;
 }

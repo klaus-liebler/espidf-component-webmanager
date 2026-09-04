@@ -12,7 +12,8 @@ public interface IAccessPoint
 [BinaryType]
 public class AccessPoint : IAccessPoint
 {
-	public string Ssid;
+	// 32 = ssid[32] aus esp_wifi_types_generic.h (IEEE-802.11-SSID-Obergrenze).
+	[BinaryMaxEncodedByteLength(32)] public string Ssid;
 	public int PrimaryChannel;
 	public int Rssi;
 	public int AuthMode;
@@ -27,31 +28,33 @@ public class RequestNetworkInformation
 [BinaryMessage(MessageKind.Response)]
 public class ResponseNetworkInformation
 {
-	public string Hostname;
-	public string SsidAp;
-	public string PasswordAp;
+	[BinaryMaxEncodedByteLength(32)] public string Hostname;
+	[BinaryMaxEncodedByteLength(32)] public string SsidAp;
+	// 63 = WPA2-PSK-Maximallaenge laut Standard (password[64] in esp_wifi_types_generic.h).
+	[BinaryMaxEncodedByteLength(63)] public string PasswordAp;
 	public uint IpAp;
 	public bool IsConnectedSta;
-	public string SsidSta;
+	[BinaryMaxEncodedByteLength(32)] public string SsidSta;
 	public uint IpSta;
 	public uint NetmaskSta;
 	public uint GatewaySta;
 	public sbyte RssiSta;
-	public IAccessPoint[] Accesspoints;
+	// 8 = MAX_AP_NUM aus webmanager_constants.hh.
+	[BinaryMaxItemCount(8)] public IAccessPoint[] Accesspoints;
 }
 
 [BinaryMessage(MessageKind.Request)]
 public class RequestWifiConnect
 {
-	public string Ssid;
-	public string Password;
+	[BinaryMaxEncodedByteLength(32)] public string Ssid;
+	[BinaryMaxEncodedByteLength(63)] public string Password;
 }
 
 [BinaryMessage(MessageKind.Response)]
 public class ResponseWifiConnect
 {
 	public bool Success;
-	public string Ssid;
+	[BinaryMaxEncodedByteLength(32)] public string Ssid;
 	public uint Ip;
 	public uint Netmask;
 	public uint Gateway;

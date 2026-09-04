@@ -50,8 +50,8 @@ public class RequestDebugData
 public class ResponseDebugData
 {
 	public uint DebugInfoHash;
-	public BoolValue[] Bools;
-	public IntValue[] Integers;
-	public FloatValue[] Floats;
-	public ColorValue[] Colors;
+	[BinaryMaxItemCount(64)] public BoolValue[] Bools;
+	[BinaryMaxItemCount(64)] public IntValue[] Integers;
+	[BinaryMaxItemCount(64)] public FloatValue[] Floats;
+	[BinaryMaxItemCount(64)] public ColorValue[] Colors;
 }

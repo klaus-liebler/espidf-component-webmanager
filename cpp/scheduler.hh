@@ -40,7 +40,7 @@ namespace scheduler
                 return 0;
             time_t currentTime;
 
-            time(&currentTime); // Get the current time
+            ::time(&currentTime); // Get the current time -- qualifiziert, da "time" hier sonst mit einer anderen im Scope sichtbaren Ueberladung mehrdeutig ist
             return GetCurrentValueOfSchedule(schedulerName, currentTime);
         }
 

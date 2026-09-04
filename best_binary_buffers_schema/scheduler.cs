@@ -49,7 +49,9 @@ public interface IScheduleContainer
 [BinaryType]
 public class Schedule : IScheduleContainer
 {
-	public string Name;
+	// 15 = NVS_KEY_NAME_MAX_SIZE(16)-1 -- name wird 1:1 als NVS-Key verwendet (scheduler.hh:
+	// nvs_set_blob(nvsSchedulerHandle, req.newName, ...)).
+	[BinaryMaxEncodedByteLength(15)] public string Name;
 	public IScheduleVariant Schedule;
 }
 
@@ -70,7 +72,7 @@ public interface ISchedulerListItem
 [BinaryType]
 public class SchedulerListItem : ISchedulerListItem
 {
-	public string Name;
+	[BinaryMaxEncodedByteLength(15)] public string Name;
 	public ScheduleType Type;
 }
 
@@ -82,13 +84,14 @@ public class RequestSchedulerList
 [BinaryMessage(MessageKind.Response)]
 public class ResponseSchedulerList
 {
-	public ISchedulerListItem[] Items;
+	// 40: passend zu scheduler.hh's items_scratch[64 * 40].
+	[BinaryMaxItemCount(40)] public ISchedulerListItem[] Items;
 }
 
 [BinaryMessage(MessageKind.Request)]
 public class RequestSchedulerOpen
 {
-	public string Name;
+	[BinaryMaxEncodedByteLength(15)] public string Name;
 	public ScheduleType Type;
 }
 
@@ -107,7 +110,7 @@ public class RequestSchedulerSave
 [BinaryMessage(MessageKind.Response)]
 public class ResponseSchedulerSave
 {
-	public string Name;
+	[BinaryMaxEncodedByteLength(15)] public string Name;
 }
 
 /// Kein Response-Gegenstueck im urspruenglichen Flatbuffers-Schema -- Request hier trotzdem als Kind
@@ -115,13 +118,13 @@ public class ResponseSchedulerSave
 [BinaryMessage(MessageKind.Request)]
 public class RequestSchedulerRename
 {
-	public string OldName;
-	public string NewName;
+	[BinaryMaxEncodedByteLength(15)] public string OldName;
+	[BinaryMaxEncodedByteLength(15)] public string NewName;
 }
 
 /// Kein Response-Gegenstueck im urspruenglichen Flatbuffers-Schema, s. Kommentar bei RequestSchedulerRename.
 [BinaryMessage(MessageKind.Request)]
 public class RequestSchedulerDelete
 {
-	public string Name;
+	[BinaryMaxEncodedByteLength(15)] public string Name;
 }

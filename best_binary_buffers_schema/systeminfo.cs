@@ -20,16 +20,18 @@ public interface IPartitionInfo
 [BinaryType]
 public class PartitionInfo : IPartitionInfo
 {
-	public string Label;
+	// Bounds aus ESP-IDF: esp_partition.h (label[17]) sowie esp_app_desc.h (project_name[32],
+	// version[32], date[16], time[16]).
+	[BinaryMaxEncodedByteLength(16)] public string Label;
 	public byte Type;
 	public byte Subtype;
 	public uint Size;
 	public sbyte OtaState;
 	public bool Running;
-	public string AppName;
-	public string AppVersion;
-	public string AppDate;
-	public string AppTime;
+	[BinaryMaxEncodedByteLength(31)] public string AppName;
+	[BinaryMaxEncodedByteLength(31)] public string AppVersion;
+	[BinaryMaxEncodedByteLength(15)] public string AppDate;
+	[BinaryMaxEncodedByteLength(15)] public string AppTime;
 }
 
 [BinaryMessage(MessageKind.Request)]
@@ -58,5 +60,5 @@ public class ResponseSystemData
 	public ushort ChipRevision;
 	public byte ChipCores;
 	public float ChipTemperature;
-	public IPartitionInfo[] Partitions;
+	[BinaryMaxItemCount(16)] public IPartitionInfo[] Partitions;
 }
