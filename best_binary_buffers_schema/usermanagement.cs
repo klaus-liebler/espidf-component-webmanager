@@ -26,9 +26,9 @@ public enum Role : byte
 [BinaryMessage(MessageKind.Event)]
 public class UserRecord
 {
-	public string Username;
-	public string Salt;         // hex-kodiert, 16 zufaellige Bytes (esp_fill_random)
-	public string PasswordHash; // hex-kodiert, SHA-256(salt || password)
+	[BinaryMaxEncodedByteLength(32)] public string Username;
+	[BinaryMaxEncodedByteLength(32)] public string Salt;         // hex-kodiert, 16 zufaellige Bytes (esp_fill_random)
+	[BinaryMaxEncodedByteLength(64)] public string PasswordHash; // hex-kodiert, SHA-256(salt || password)
 	public byte Roles;          // Bitmaske aus Role
 	public uint Epoch;          // hochgezaehlt bei Passwortaenderung -> invalidiert alle bestehenden Sessions dieses Nutzers
 }
