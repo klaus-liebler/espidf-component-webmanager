@@ -38,7 +38,7 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <dirent.h>
-#include <mbedtls/sha256.h>
+#include <mbedtls/md.h>
 #if (CONFIG_HTTPD_MAX_REQ_HDR_LEN < 1024)
 #error "CONFIG_HTTPD_MAX_REQ_HDR_LEN<1024 (Max HTTP Request Header Length)"
 #endif
@@ -1097,14 +1097,15 @@ namespace webmanager
         // Abhaengigkeit ueber das bereits eingebundene mbedtls hinaus.
         static std::string hash_password(const std::string &salt_hex, const char *password)
         {
-            mbedtls_sha256_context ctx;
-            mbedtls_sha256_init(&ctx);
-            mbedtls_sha256_starts(&ctx, 0);
-            mbedtls_sha256_update(&ctx, (const uint8_t *)salt_hex.data(), salt_hex.size());
-            mbedtls_sha256_update(&ctx, (const uint8_t *)password, strlen(password));
+            mbedtls_md_context_t ctx;
+            mbedtls_md_init(&ctx);
+            mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+            mbedtls_md_starts(&ctx);
+            mbedtls_md_update(&ctx, (const uint8_t *)salt_hex.data(), salt_hex.size());
+            mbedtls_md_update(&ctx, (const uint8_t *)password, strlen(password));
             uint8_t digest[32];
-            mbedtls_sha256_finish(&ctx, digest);
-            mbedtls_sha256_free(&ctx);
+            mbedtls_md_finish(&ctx, digest);
+            mbedtls_md_free(&ctx);
             return bytes_to_hex(digest, sizeof(digest));
         }
 
