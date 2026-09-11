@@ -1409,17 +1409,25 @@ namespace webmanager
         // der Browser den Login geraeteuebergreifend merkt und beim naechsten Besuch automatisch (ohne
         // erneute Passwortabfrage) wieder anmeldet, solange das Cookie nicht abgelaufen ist. 'Secure'
         // ist unbedenklich, da dieser Server ausschliesslich ueber HTTPS erreichbar ist (s. main.cc).
-        void set_session_cookies(httpd_req_t *req, const std::string &token, const std::string &username)
+        //
+        // WICHTIG: httpd_resp_set_hdr() kopiert den value-String NICHT, sondern merkt sich nur den
+        // Pointer -- er muss bis zum tatsaechlichen httpd_resp_send()/sendstr() gueltig bleiben (s.
+        // Doku in esp_http_server.h). Deshalb schreiben wir hier in Puffer, die der AUFRUFER auf
+        // seinem eigenen Stackframe haelt (statt in lokale Puffer dieser Funktion, die nach Rueckkehr
+        // ungueltig waeren und von nachfolgenden Aufrufen wie httpd_resp_set_status()/sendstr()
+        // ueberschrieben wuerden -- genau das fuehrte zuvor zu einem kaputten Set-Cookie-Header und
+        // damit dazu, dass der Login serverseitig erfolgreich war, aber der Browser keine gueltige
+        // Session-Cookie erhielt).
+        void set_session_cookies(httpd_req_t *req, const std::string &token, const std::string &username,
+                                  char (&session_cookie_buf)[160], char (&username_cookie_buf)[160])
         {
             long long maxAgeSeconds = (long long)(SESSION_MAX_AGE_US / 1000000);
-            char session_cookie[160];
-            snprintf(session_cookie, sizeof(session_cookie),
+            snprintf(session_cookie_buf, sizeof(session_cookie_buf),
                 "session=%s; Path=/; Max-Age=%lld; HttpOnly; Secure; SameSite=Strict", token.c_str(), maxAgeSeconds);
-            httpd_resp_set_hdr(req, "Set-Cookie", session_cookie);
-            char username_cookie[160];
-            snprintf(username_cookie, sizeof(username_cookie),
+            httpd_resp_set_hdr(req, "Set-Cookie", session_cookie_buf);
+            snprintf(username_cookie_buf, sizeof(username_cookie_buf),
                 "username=%s; Path=/; Max-Age=%lld; Secure; SameSite=Strict", username.c_str(), maxAgeSeconds);
-            httpd_resp_set_hdr(req, "Set-Cookie", username_cookie);
+            httpd_resp_set_hdr(req, "Set-Cookie", username_cookie_buf);
         }
 
         // Fuer Admin-only-Endpunkte: liest+validiert das Session-Cookie und prueft, ob die Rolle gesetzt
@@ -1655,7 +1663,9 @@ namespace webmanager
             if (validate_credentials_and_load(username, password, user)) {
                 ESP_LOGI(TAG, "Login successful for user '%s'", username);
                 std::string token = create_session(user);
-                set_session_cookies(req, token, user.username);
+                char session_cookie_buf[160];
+                char username_cookie_buf[160];
+                set_session_cookies(req, token, user.username, session_cookie_buf, username_cookie_buf);
                 httpd_resp_set_status(req, "303 See Other");
                 httpd_resp_set_hdr(req, "Location", "/");
                 httpd_resp_sendstr(req, "");
@@ -1710,7 +1720,9 @@ namespace webmanager
                     // set_session_cookies()).
                     char token_buf[33];
                     extract_session_token(cookie_buf, token_buf);
-                    set_session_cookies(req, token_buf, username);
+                    char session_cookie_buf[160];
+                    char username_cookie_buf[160];
+                    set_session_cookies(req, token_buf, username, session_cookie_buf, username_cookie_buf);
                     httpd_resp_set_type(req, "text/html");
                     httpd_resp_set_hdr(req, "Content-Encoding", "br");
                     httpd_resp_send(req, webmanager_html_br_start, webmanager_html_br_length);
@@ -1911,7 +1923,15 @@ namespace webmanager
             if (init_netif_and_create_event_loop)
             {
                 ESP_ERROR_CHECK(esp_netif_init());
-                ESP_ERROR_CHECK(esp_event_loop_create_default());
+                // Manche HALs (z.B. hal_sensactHsNano3.hh fuer den W5500-Ethernet-Anschluss) rufen
+                // esp_event_loop_create_default() bereits vor Begin() auf. esp_netif_init() ist
+                // idempotent, esp_event_loop_create_default() dagegen nicht (liefert
+                // ESP_ERR_INVALID_STATE bei einem zweiten Aufruf) -- das ist hier kein Fehler.
+                esp_err_t err = esp_event_loop_create_default();
+                if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+                {
+                    ESP_ERROR_CHECK(err);
+                }
             }
 
             this->plugins = plugins;
