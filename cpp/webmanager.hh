@@ -1,70 +1,19 @@
 #pragma once
-#include <sdkconfig.h>
-#include <cstring>
-#include <cctype>
-#include <cstdlib>
-#include <ctime>
-#include <algorithm>
-#include <vector>
-
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/queue.h>
-#include <freertos/timers.h>
-#include <esp_ota_ops.h>
-#include <esp_partition.h>
-#include <esp_timer.h>
-#include <esp_chip_info.h>
-#include <esp_mac.h>
+#include "webmanager_base.hh"
 #include <esp_wifi.h>
-#include "esp_netif.h"
-
-#include "esp_tls.h"
-#include <hal/efuse_hal.h>
-#include <nvs_flash.h>
-#include <lwip/err.h>
-#include <lwip/sys.h>
-#include <lwip/api.h>
-#include <lwip/netdb.h>
-#include <lwip/ip4_addr.h>
-#include <driver/gpio.h>
-#include <nvs.h>
-#include <spi_flash_mmap.h>
-#include <esp_sntp.h>
-#include <time.h>
-#include <mdns.h>
-#include <common-esp32.hh>
-#include <esp_log.h>
-#include <sys/time.h>
-#include <sys/stat.h>
-#include <dirent.h>
-#include <mbedtls/md.h>
-#if (CONFIG_HTTPD_MAX_REQ_HDR_LEN < 1024)
-#error "CONFIG_HTTPD_MAX_REQ_HDR_LEN<1024 (Max HTTP Request Header Length)"
-#endif
-
-#ifndef CONFIG_HTTPD_WS_SUPPORT
-#error "Enable Websocket support for HTTPD in menuconfig"
-#endif
-#include "esp_vfs.h"
 
 #define TAG "WMAN"
-#include "webmanager_constants.hh"
-#include "webmanager_interfaces.hh"
-#include "webmanager_async_response.hh"
-#include "wsprotocol_cpp/ws_protocol.hh"
 
 namespace webmanager
 {
-    extern const char webmanager_html_br_start[] asm("_binary_index_compressed_br_start");
-    extern const size_t webmanager_html_br_length asm("index_compressed_br_length");
-
-    class M : public webmanager::iWebmanagerCallback
+    // WLAN-Variante des Webmanagers: alles Generische (HTTP(S)-Server, Login/Sessions, SPA,
+    // Websocket/Plugins, mDNS, SNTP) steckt in aWebmanagerBase, hier liegt ausschliesslich der
+    // WLAN-spezifische Teil (STA-Verbindung, AccessPoint-Fallback, wifimanager-Websocket-
+    // Namespace, Supervisor-State-Machine). Die oeffentliche API ist unveraendert.
+    class M : public aWebmanagerBase
     {
     private:
         static M *singleton;
-        uint8_t *http_buffer;
-        const char* hostname{nullptr};
 
         esp_netif_t *wifi_netif_sta{nullptr};
         esp_netif_t *wifi_netif_ap{nullptr};
@@ -77,48 +26,6 @@ namespace webmanager
 
         SemaphoreHandle_t webmanager_semaphore{nullptr}; // stellt sicher, dass die Timer-Aufrufe nicht überlappen können
         TimerHandle_t timSupervisor{nullptr};
-
-        httpd_handle_t http_server{nullptr};
-        int websocket_file_descriptor{-1};
-        // Aktuell authentifizierter Nutzer der (einzigen) offenen Websocket-Verbindung -- fuer
-        // rollenbasierte Autorisierung durch Plugins/Message-Handler (s. GetCurrentSessionRoles()).
-        std::string current_ws_username{""};
-        uint8_t current_ws_roles{0};
-
-        using Role = WsProtocol::usermanagement::Role;
-
-        // Bootstrap-Zugangsdaten aus Begin(...) -- werden NUR verwendet, um beim allerersten Start
-        // (User-Store unter /spiffs/users/ ist leer) einen einzigen Admin-Nutzer anzulegen. Danach ist
-        // der User-Store (s.u.) die alleinige Quelle der Wahrheit fuer Zugangsdaten.
-        std::string bootstrap_admin_username{""};
-        std::string bootstrap_admin_password{""};
-
-        // Ein serverseitig gehaltener Login-Session-Slot (Opaque-Token-Schema, s.
-        // docs/plan_v2/03-wifimanager-review.md). Mehrere Slots statt vormals nur eines einzigen
-        // globalen Tokens -- ermoeglicht mehreren Nutzern/Browsern gleichzeitig eingeloggt zu sein
-        // (unabhaengig von der Websocket-Verbindung, von der es weiterhin nur eine gleichzeitig aktive
-        // gibt).
-        struct Session
-        {
-            std::string token{""};
-            std::string username{""};
-            uint8_t roles{0};
-            time_t expiry_us{0};
-            bool InUse() const { return !token.empty(); }
-        };
-        Session sessions[MAX_SESSIONS]{};
-
-        // Ein persistierter Nutzerdatensatz (s. best_binary_buffers_schema/usermanagement.cs), im
-        // Arbeitsspeicher entpackt (die vom generierten Decode() gelieferten Payload-Zeiger zeigen in
-        // einen kurzlebigen Lese-Puffer, s. load_user()).
-        struct StoredUser
-        {
-            std::string username{""};
-            std::string salt{""};
-            std::string passwordHash{""};
-            uint8_t roles{0};
-            uint32_t epoch{0};
-        };
 
         // Das ist der Status, der alles beschreiben muss
         WorkingState workingState{WorkingState::AP_STARTED};
@@ -144,6 +51,9 @@ namespace webmanager
         // trotzdem unveraendert in der Response zurueckgegeben werden soll (s. Schema-Kommentar
         // in ws-protocol/wifimanager.cs).
         uint16_t lastWifiConnectRequestId{0};
+
+        // aus Begin() uebernommen, wird erst in StartNetworkStateMachine() ausgewertet
+        bool resetStoredWifiConnectionOnStart{false};
 
         const char* ws2c(WorkingState w){
             return WorkingStateStrings[static_cast<size_t>(w)];
@@ -181,9 +91,7 @@ namespace webmanager
             }
         }
 
-        std::vector<iWebmanagerPlugin *> *plugins{nullptr};
-
-        M() { http_buffer = new uint8_t[HTTP_BUFFER_SIZE]; }
+        M() {}
 
         void connectAsSTA(time_t now_us)
         {
@@ -427,7 +335,8 @@ namespace webmanager
             xSemaphoreGive(webmanager_semaphore);
         }
 
-        void ip_event_handler(esp_event_base_t event_base, int32_t event_id, void *event_data)
+        // Nicht-ETH-IP-Ereignisse (ETH wird generisch in aWebmanagerBase::ip_event_handler behandelt)
+        void OnIpEvent(int32_t event_id, void *event_data) override
         {
             xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
             time_t now_us = esp_timer_get_time();
@@ -448,19 +357,6 @@ namespace webmanager
                 esp_sntp_init();
                 break;
             }
-            case IP_EVENT_ETH_GOT_IP:
-            {
-                const ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-                const esp_netif_ip_info_t *ip = &(event->ip_info);
-                ESP_LOGI(TAG, "ETHERNET got IP from DHCP: {'ip':'" IPSTR "', 'netmask':'" IPSTR "','gw':'" IPSTR "', 'hostname':'%s'}", IP2STR(&ip->ip), IP2STR(&ip->netmask), IP2STR(&ip->gw), hostname);
-                esp_sntp_init(); // seems to be safe if called twice (ETH and WIFI STA!)
-                break;
-            }
-            case IP_EVENT_ETH_LOST_IP:
-            {
-                ESP_LOGI(TAG, "IP_EVENT_ETH_LOST_IP");
-                break;
-            }
             case IP_EVENT_STA_LOST_IP:
             {
                 ESP_LOGD(TAG, "IP_EVENT_STA_LOST_IP");
@@ -470,175 +366,11 @@ namespace webmanager
             xSemaphoreGive(webmanager_semaphore);
         }
 
-        void sntp_handler()
-        {
-            time_t now;
-            char strftime_buf[64];
-            struct tm timeinfo;
-            time(&now);
-            localtime_r(&now, &timeinfo);
-            strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-            ESP_LOGI(TAG, "Notification of a time synchronization. The current date/time in Berlin is: %s", strftime_buf);
-            for (const auto &p : *this->plugins)
-            {
-                p->OnTimeUpdate(this);
-            }
-            // LogJournal(messagecodes::C::SNTP, esp_timer_get_time() / 1000);
-        }
-
-        static void ws_async_send(void *arg)
-        {
-            M *myself = M::GetSingleton();
-            AsyncResponse *a = static_cast<AsyncResponse *>(arg);
-            assert(a);
-            assert(a->buffer);
-            assert(a->buffer_len);
-            assert(myself);
-            if (myself->http_server && myself->websocket_file_descriptor != -1)
-            {
-                httpd_ws_frame_t ws_pkt = {false, false, HTTPD_WS_TYPE_BINARY, a->buffer, a->buffer_len};
-                esp_err_t ret = httpd_ws_send_frame_async(myself->http_server, myself->websocket_file_descriptor, &ws_pkt);
-                if (ret == ESP_OK)
-                {
-                    ESP_LOGD(TAG, "httpd_ws_send_frame_async: data_len:%u\n", ws_pkt.len);
-                }
-                else
-                {
-                    ESP_LOGW(TAG, "httpd_ws_send_frame_async failed (0x%x). Invalidating websocket session fd %d", (unsigned int)ret, myself->websocket_file_descriptor);
-                    httpd_sess_trigger_close(myself->http_server, myself->websocket_file_descriptor);
-                    myself->websocket_file_descriptor = -1;
-                }
-                // should be syncronous. So the buffer can be deleted, when the function returns
-            }
-            delete a;
-        }
-
-        void close_active_websocket_before_ap_shutdown()
-        {
-            if (!http_server || websocket_file_descriptor == -1)
-            {
-                return;
-            }
-
-            const int ws_fd = websocket_file_descriptor;
-
-            if (httpd_ws_get_fd_info(http_server, ws_fd) == HTTPD_WS_CLIENT_WEBSOCKET)
-            {
-                uint8_t close_payload[2] = {0x03, 0xE8}; // 1000 = normal closure
-                httpd_ws_frame_t close_pkt = {false, false, HTTPD_WS_TYPE_CLOSE, close_payload, sizeof(close_payload)};
-                esp_err_t send_ret = httpd_ws_send_frame_async(http_server, ws_fd, &close_pkt);
-                if (send_ret != ESP_OK)
-                {
-                    ESP_LOGW(TAG, "Failed to send websocket close frame to fd %d (%d)", ws_fd, send_ret);
-                }
-            }
-
-            httpd_sess_trigger_close(http_server, ws_fd);
-            websocket_file_descriptor = -1;
-            ESP_LOGI(TAG, "Closed active websocket session fd %d before AP shutdown", ws_fd);
-        }
-
-        esp_err_t handle_webmanager_ws(httpd_req_t *req)
-        {
-            if (req->method == HTTP_GET)
-            {
-                // Validate session token on WebSocket handshake
-                char cookie_buf[256] = {0};
-                std::string username;
-                uint8_t roles = 0;
-                if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) != ESP_OK ||
-                    !validate_session_token(cookie_buf, username, roles))
-                {
-                    ESP_LOGW(TAG, "WebSocket: No valid session token");
-                    httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
-                    return ESP_FAIL;
-                }
-
-                // Fuer rollenbasierte Autorisierung durch Plugins/Message-Handler, s.
-                // GetCurrentSessionRoles(). Es gibt ohnehin nur eine gleichzeitig aktive
-                // Websocket-Verbindung (s. websocket_file_descriptor), also genuegt ein einzelnes Feld.
-                current_ws_username = username;
-                current_ws_roles = roles;
-                ESP_LOGI(TAG, "WebSocket connection authenticated as '%s' (roles=0x%02x) and opened (fd=%d)", username.c_str(), roles, (int)httpd_req_to_sockfd(req));
-                return ESP_OK;
-            }
-
-            httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-            httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
-
-            httpd_ws_frame_t ws_pkt = {false, false, HTTPD_WS_TYPE_BINARY, nullptr, 0};
-
-            // always store the last websocket file descriptor
-            this->websocket_file_descriptor = httpd_req_to_sockfd(req);
-
-            /* Set max_len = 0 to get the frame len */
-            esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
-            if (ret != ESP_OK)
-            {
-                // Bad/malformed websocket frames can happen during disconnect/AP transitions.
-                // Never abort the device from this callback.
-                if (ret == ESP_ERR_INVALID_STATE)
-                {
-                    ESP_LOGW(TAG, "Ignoring websocket frame in invalid state (%d)", ret);
-                    return ESP_OK;
-                }
-                ESP_LOGW(TAG, "httpd_ws_recv_frame(header) failed with %d", ret);
-                return ret;
-            }
-            if (ws_pkt.len == 0 || ws_pkt.type != HTTPD_WS_TYPE_BINARY)
-            {
-                ESP_LOGE(TAG, "Received an empty or an non binary websocket frame");
-                return ESP_OK;
-            }
-            uint8_t *buf = new uint8_t[ws_pkt.len];
-            assert(buf);
-            ws_pkt.payload = buf;
-            ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
-
-            if (ret != ESP_OK)
-            {
-                ESP_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
-                delete[] buf;
-                return ret;
-            }
-            if (ws_pkt.len < 4)
-            {
-                ESP_LOGW(TAG, "Ignoring short websocket binary frame (len=%u)", (unsigned)ws_pkt.len);
-                delete[] buf;
-                return ESP_OK;
-            }
-            uint16_t namespaceId = (uint16_t)(buf[0] | (buf[1] << 8));
-            uint16_t messageTypeId = (uint16_t)(buf[2] | (buf[3] << 8));
-            eMessageReceiverResult success = ProvideWebsocketMessage(this, req, &ws_pkt, namespaceId, messageTypeId, buf, ws_pkt.len);
-            if (success == eMessageReceiverResult::NOT_FOR_ME && plugins)
-            {
-                for (auto p : *plugins)
-                {
-                    success = p->ProvideWebsocketMessage(this, req, &ws_pkt, namespaceId, messageTypeId, buf, ws_pkt.len);
-                    if (success != eMessageReceiverResult::NOT_FOR_ME)
-                    {
-                        break;
-                    }
-                }
-            }
-            if (success == eMessageReceiverResult::NOT_FOR_ME)
-            {
-                ESP_LOGW(TAG, "Not yet implemented request for namespace %u, neither internal nor in a plugin", (unsigned)namespaceId);
-            }
-            else if (success == eMessageReceiverResult::FOR_ME_BUT_FAILED)
-            {
-                ESP_LOGW(TAG, "Request for namespace %u has been implemented by plugin, but processing failed", (unsigned)namespaceId);
-            }
-            delete[] buf;
-            return ESP_OK;
-        }
-
         // wifimanager wird hier direkt (nicht ueber den generischen 'plugins'-Vektor) behandelt,
         // weil es eng mit der WLAN-State-Machine dieser Klasse verzahnt ist -- funktional aber ein
         // regulaerer iWebmanagerPlugin-Aufruf wie jeder andere Namespace, kein Sonderfall im
         // Dispatcher mehr (anders als vorher).
-        eMessageReceiverResult ProvideWebsocketMessage(iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint16_t namespaceId, uint16_t messageTypeId, const uint8_t *frame, size_t frameLen)
+        eMessageReceiverResult ProvideWebsocketMessage(iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint16_t namespaceId, uint16_t messageTypeId, const uint8_t *frame, size_t frameLen) override
         {
             if (namespaceId != WsProtocol::wifimanager::NAMESPACE_ID)
                 return eMessageReceiverResult::NOT_FOR_ME;
@@ -794,947 +526,6 @@ namespace webmanager
             return ret == ESP_OK ? eMessageReceiverResult::OK : eMessageReceiverResult::FOR_ME_BUT_FAILED;
         }
 
-        esp_err_t handle_ota_post(httpd_req_t *req)
-        {
-            ESP_LOGI(TAG, "in handle_ota_post");
-            char buf[1024];
-            esp_ota_handle_t ota_handle;
-            size_t remaining = req->content_len;
-
-            const esp_partition_t *ota_partition = esp_ota_get_next_update_partition(NULL);
-            ESP_ERROR_CHECK(esp_ota_begin(ota_partition, OTA_SIZE_UNKNOWN, &ota_handle));
-
-            while (remaining > 0)
-            {
-                int recv_len = httpd_req_recv(req, buf, std::min(remaining, (size_t)sizeof(buf)));
-                if (recv_len <= 0)
-                {
-                    // Serious Error: Abort OTA
-                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Protocol Error");
-                    return ESP_FAIL;
-                }
-                if (recv_len == HTTPD_SOCK_ERR_TIMEOUT)
-                {
-                    // Timeout Error: Just retry
-                    continue;
-                }
-                if (esp_ota_write(ota_handle, (const void *)buf, recv_len) != ESP_OK)
-                {
-                    // Successful Upload: Flash firmware chunk
-                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash Error");
-                    return ESP_FAIL;
-                }
-
-                remaining -= recv_len;
-            }
-
-            // Validate and switch to new OTA image and reboot
-            if (esp_ota_end(ota_handle) != ESP_OK || esp_ota_set_boot_partition(ota_partition) != ESP_OK)
-            {
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Validation / Activation Error");
-                return ESP_FAIL;
-            }
-
-            httpd_resp_sendstr(req, "Firmware update complete, rebooting now!\n");
-
-            vTaskDelay(500 / portTICK_PERIOD_MS);
-            esp_restart();
-
-            return ESP_OK;
-        }
-
-        esp_err_t http_resp_dir_html(httpd_req_t *req, const char *dirpath)
-        {
-            struct dirent *entry;
-            DIR *dir = opendir(dirpath);
-            if (!dir)
-            {
-                ESP_LOGE(TAG, "Failed to stat dir : %s", dirpath);
-                httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Directory does not exist");
-                return ESP_FAIL;
-            }
-            httpd_resp_set_type(req, "application/json");
-            httpd_resp_sendstr_chunk(req, "{'files':[");
-            while ((entry = readdir(dir)) != nullptr)
-            {
-                if (entry->d_type == DT_DIR)
-                    continue;
-                httpd_resp_sendstr_chunk(req, "'");
-                httpd_resp_sendstr_chunk(req, entry->d_name);
-                httpd_resp_sendstr_chunk(req, "',");
-            }
-            closedir(dir);
-            dir = opendir(dirpath);
-
-            httpd_resp_sendstr_chunk(req, "], 'dirs':[");
-            while ((entry = readdir(dir)) != nullptr)
-            {
-                if (entry->d_type != DT_DIR)
-                    continue;
-                httpd_resp_sendstr_chunk(req, "'");
-                httpd_resp_sendstr_chunk(req, entry->d_name);
-                httpd_resp_sendstr_chunk(req, "',");
-            }
-            closedir(dir);
-            httpd_resp_sendstr_chunk(req, "]}");
-            httpd_resp_sendstr_chunk(req, NULL);
-            return ESP_OK;
-        }
-
-        esp_err_t handle_files_get(httpd_req_t *req)
-        {
-            FILE *fd = nullptr;
-            struct stat file_stat;
-
-            const char *path = req->uri + FILES_BASE_PATH_LEN;
-            ESP_LOGI(TAG, "Got GET files for filename %s ", path);
-
-            httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-            httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
-
-            /* If name has trailing '/', respond with directory contents */
-            if (path[strlen(path) - 1] == '/')
-            {
-                return http_resp_dir_html(req, path);
-            }
-
-            if (stat(path, &file_stat) == -1)
-            {
-                httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File does not exist");
-                return ESP_FAIL;
-            }
-
-            fd = fopen(path, "r");
-            if (!fd)
-            {
-                ESP_LOGE(TAG, "Failed to read existing file : %s", path);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read existing file");
-                return ESP_FAIL;
-            }
-
-            ESP_LOGI(TAG, "Sending file : %s (%ld bytes)...", path, file_stat.st_size);
-
-            size_t chunksize;
-            do
-            {
-                /* Read file in chunks into the scratch buffer */
-                chunksize = fread(http_buffer, 1, HTTP_BUFFER_SIZE, fd);
-
-                if (chunksize > 0)
-                {
-                    if (httpd_resp_send_chunk(req, (const char *)http_buffer, chunksize) != ESP_OK)
-                    {
-                        fclose(fd);
-                        ESP_LOGE(TAG, "File sending failed!");
-                        httpd_resp_sendstr_chunk(req, nullptr);
-                        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to send file");
-                        return ESP_FAIL;
-                    }
-                }
-            } while (chunksize != 0);
-
-            fclose(fd);
-            httpd_resp_send_chunk(req, nullptr, 0);
-            return ESP_OK;
-        }
-
-        esp_err_t handle_files_post(httpd_req_t *req)
-        {
-            FILE *fd = NULL;
-            struct stat file_stat;
-
-            httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-            httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
-
-            const char *path = req->uri + FILES_BASE_PATH_LEN;
-            ESP_LOGI(TAG, "Got POST files for filename %s ", path);
-
-            if (path[strlen(path) - 1] == '/')
-            {
-                ESP_LOGE(TAG, "We need a filename, not a directory name : %s", path);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "We need a filename, not a directory name!");
-                return ESP_FAIL;
-            }
-
-            if (false && stat(path, &file_stat) == 0)
-            {
-                // Files should be overwritten, hence "false &&"
-                ESP_LOGE(TAG, "File already exists : %s", path);
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "File already exists");
-                return ESP_FAIL;
-            }
-
-            if (req->content_len > MAX_FILE_SIZE)
-            {
-                ESP_LOGE(TAG, "File too large : %d bytes", req->content_len);
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "File too large");
-                return ESP_FAIL;
-            }
-
-            fd = fopen(path, "w");
-            if (!fd)
-            {
-                ESP_LOGE(TAG, "Failed to create file : %s", path);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create file");
-                return ESP_FAIL;
-            }
-
-            ESP_LOGI(TAG, "Receiving file : %s...", path);
-            size_t received;
-            size_t remaining = req->content_len;
-
-            while (remaining > 0)
-            {
-
-                ESP_LOGI(TAG, "Remaining size : %d", remaining);
-                /* Receive the file part by part into a buffer */
-                if ((received = httpd_req_recv(req, (char *)http_buffer, std::min(remaining, HTTP_BUFFER_SIZE))) <= 0)
-                {
-                    if (received == HTTPD_SOCK_ERR_TIMEOUT)
-                        continue;
-                    /* In case of unrecoverable error,
-                     * close and delete the unfinished file*/
-                    fclose(fd);
-                    unlink(path);
-                    ESP_LOGE(TAG, "File reception failed!");
-                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
-                    return ESP_FAIL;
-                }
-
-                /* Write buffer content to file on storage */
-                if (received && (received != fwrite(http_buffer, 1, received, fd)))
-                {
-                    /* Couldn't write everything to file!
-                     * Storage may be full? */
-                    fclose(fd);
-                    unlink(path);
-
-                    ESP_LOGE(TAG, "File write failed!");
-                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write file to storage");
-                    return ESP_FAIL;
-                }
-                remaining -= received;
-            }
-
-            fclose(fd);
-            if (stat(path, &file_stat) != 0)
-            {
-                ESP_LOGE(TAG, "File stat was not possible. write failed!");
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "File stat was not possible. write failed!");
-                return ESP_FAIL;
-            }
-            ESP_LOGI(TAG, "File reception for %s complete. File has %ldbytes", path, file_stat.st_size);
-            httpd_resp_sendstr(req, "File uploaded successfully");
-            return ESP_OK;
-        }
-
-        esp_err_t handle_files_delete(httpd_req_t *req)
-        {
-            struct stat file_stat;
-            const char *path = req->uri + FILES_BASE_PATH_LEN;
-            ESP_LOGI(TAG, "Got DELETE files for filename %s ", path);
-
-            /* Filename cannot have a trailing '/' */
-            if (path[strlen(path) - 1] == '/')
-            {
-                ESP_LOGE(TAG, "We need a filename, not a directory name : %s", path);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "We need a filename, not a directory name!");
-                return ESP_FAIL;
-            }
-
-            if (stat(path, &file_stat) == -1)
-            {
-                ESP_LOGE(TAG, "File does not exist : %s", path);
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "File does not exist");
-                return ESP_FAIL;
-            }
-
-            ESP_LOGI(TAG, "Deleting file : %s", path);
-            unlink(path);
-            httpd_resp_sendstr(req, "File deleted successfully");
-            return ESP_OK;
-        }
-
-        // Konstantzeitiger Vergleich (Laenge zuerst, dann XOR-Akkumulation ohne Early-Exit) --
-        // ersetzt den vormaligen std::string==-Vergleich, der bei einem Zeichen-Mismatch frueh
-        // abbricht und damit ein Timing-Seitenkanal ist. Kein externes Krypto-Lib noetig.
-        static bool constant_time_equals(const std::string &a, const std::string &b)
-        {
-            if (a.size() != b.size()) return false;
-            unsigned char diff = 0;
-            for (size_t i = 0; i < a.size(); i++) diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
-            return diff == 0;
-        }
-
-        // --- Nutzerverwaltung: Passwort-Hashing (salted SHA-256) ---------------------------------------
-
-        static std::string bytes_to_hex(const uint8_t *data, size_t len)
-        {
-            static const char *hexdigits = "0123456789abcdef";
-            std::string out;
-            out.resize(len * 2);
-            for (size_t i = 0; i < len; i++)
-            {
-                out[i * 2] = hexdigits[data[i] >> 4];
-                out[i * 2 + 1] = hexdigits[data[i] & 0x0F];
-            }
-            return out;
-        }
-
-        static std::string generate_salt_hex()
-        {
-            uint8_t salt[16];
-            esp_fill_random(salt, sizeof(salt));
-            return bytes_to_hex(salt, sizeof(salt));
-        }
-
-        // SHA256(salt || password), hex-kodiert. Ein einzelner SHA-256-Durchlauf statt eines
-        // dedizierten Passwort-KDFs (PBKDF2/bcrypt/scrypt/Argon2) -- konsistent mit dem bisherigen
-        // Sicherheitsniveau dieses Moduls (lokaler Access Point, physischer Zugriff fuer einen
-        // Offline-Angriff auf die Datei noetig, s. docs/plan_v2/03-wifimanager-review.md), ohne neue
-        // Abhaengigkeit ueber das bereits eingebundene mbedtls hinaus.
-        static std::string hash_password(const std::string &salt_hex, const char *password)
-        {
-            mbedtls_md_context_t ctx;
-            mbedtls_md_init(&ctx);
-            mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
-            mbedtls_md_starts(&ctx);
-            mbedtls_md_update(&ctx, (const uint8_t *)salt_hex.data(), salt_hex.size());
-            mbedtls_md_update(&ctx, (const uint8_t *)password, strlen(password));
-            uint8_t digest[32];
-            mbedtls_md_finish(&ctx, digest);
-            mbedtls_md_free(&ctx);
-            return bytes_to_hex(digest, sizeof(digest));
-        }
-
-        // --- Nutzerverwaltung: Ablage als eine Datei pro Nutzer unter /spiffs/users/ --------------------
-        // (s. Kommentar in best_binary_buffers_schema/usermanagement.cs, warum kein Array-Container-Typ)
-
-        // Nur alphanumerisch/'_'/'-' -- verhindert Path-Traversal (kein '/', kein '.') beim Aufbau des
-        // Dateipfads aus einem (potenziell von aussen kommenden, s. Login/Admin-Endpunkte) Benutzernamen.
-        static bool is_valid_username(const char *username)
-        {
-            size_t len = username ? strlen(username) : 0;
-            if (len == 0 || len > 32) return false;
-            for (size_t i = 0; i < len; i++)
-            {
-                char c = username[i];
-                if (!isalnum((unsigned char)c) && c != '_' && c != '-') return false;
-            }
-            return true;
-        }
-
-        static std::string user_file_path(const std::string &username)
-        {
-            return std::string("/spiffs/users/") + username + ".bin";
-        }
-
-        bool load_user(const std::string &username, StoredUser &out)
-        {
-            if (!is_valid_username(username.c_str())) return false;
-            FILE *f = fopen(user_file_path(username).c_str(), "rb");
-            if (!f) return false;
-            uint8_t buf[512];
-            size_t len = fread(buf, 1, sizeof(buf), f);
-            fclose(f);
-            if (len < 4) return false;
-            uint16_t nsId = (uint16_t)(buf[0] | (buf[1] << 8));
-            uint16_t typeId = (uint16_t)(buf[2] | (buf[3] << 8));
-            if (nsId != WsProtocol::usermanagement::NAMESPACE_ID || typeId != WsProtocol::usermanagement::UserRecord::TYPE_ID)
-            {
-                ESP_LOGE(TAG, "load_user('%s'): unexpected file header, ignoring (corrupt or wrong schema version?)", username.c_str());
-                return false;
-            }
-            WsProtocol::usermanagement::UserRecord::Payload payload{};
-            if (!WsProtocol::usermanagement::UserRecord::Decode(buf, len, payload)) return false;
-            out.username = payload.username;
-            out.salt = payload.salt;
-            out.passwordHash = payload.passwordHash;
-            out.roles = payload.roles;
-            out.epoch = payload.epoch;
-            return true;
-        }
-
-        bool save_user(const StoredUser &user)
-        {
-            if (!is_valid_username(user.username.c_str())) return false;
-            mkdir("/spiffs/users", 0777); // Fehler (z.B. existiert bereits) bewusst ignoriert
-            WsProtocol::usermanagement::UserRecord::Payload payload{};
-            payload.username = user.username.c_str();
-            payload.salt = user.salt.c_str();
-            payload.passwordHash = user.passwordHash.c_str();
-            payload.roles = user.roles;
-            payload.epoch = user.epoch;
-            uint8_t buf[512];
-            size_t written = WsProtocol::usermanagement::UserRecord::Encode(payload, buf, sizeof(buf));
-            if (written == 0)
-            {
-                ESP_LOGE(TAG, "save_user('%s'): encoded record too large for buffer", user.username.c_str());
-                return false;
-            }
-            FILE *f = fopen(user_file_path(user.username).c_str(), "wb");
-            if (!f) return false;
-            size_t ret = fwrite(buf, 1, written, f);
-            fclose(f);
-            return ret == written;
-        }
-
-        bool delete_user(const std::string &username)
-        {
-            if (!is_valid_username(username.c_str())) return false;
-            return unlink(user_file_path(username).c_str()) == 0;
-        }
-
-        std::vector<std::string> list_usernames()
-        {
-            std::vector<std::string> result;
-            DIR *dir = opendir("/spiffs/users");
-            if (!dir) return result;
-            struct dirent *entry;
-            const std::string suffix = ".bin";
-            while ((entry = readdir(dir)) != nullptr)
-            {
-                if (entry->d_type == DT_DIR) continue;
-                std::string name(entry->d_name);
-                if (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
-                    result.push_back(name.substr(0, name.size() - suffix.size()));
-            }
-            closedir(dir);
-            return result;
-        }
-
-        bool user_store_is_empty()
-        {
-            DIR *dir = opendir("/spiffs/users");
-            if (!dir) return true;
-            struct dirent *entry;
-            bool empty = true;
-            while ((entry = readdir(dir)) != nullptr)
-            {
-                if (entry->d_type == DT_DIR) continue;
-                empty = false;
-                break;
-            }
-            closedir(dir);
-            return empty;
-        }
-
-        int count_admins()
-        {
-            int count = 0;
-            for (auto &name : list_usernames())
-            {
-                StoredUser u;
-                if (load_user(name, u) && (u.roles & (uint8_t)Role::Admin)) count++;
-            }
-            return count;
-        }
-
-        void bootstrap_default_admin_if_user_store_empty()
-        {
-            if (!user_store_is_empty()) return;
-            ESP_LOGW(TAG, "No users found in user store -- creating default admin user '%s' from Begin()-parameters. Change this password after first login!", bootstrap_admin_username.c_str());
-            StoredUser admin;
-            admin.username = bootstrap_admin_username;
-            admin.salt = generate_salt_hex();
-            admin.passwordHash = hash_password(admin.salt, bootstrap_admin_password.c_str());
-            admin.roles = (uint8_t)Role::Admin;
-            admin.epoch = 0;
-            if (!save_user(admin))
-                ESP_LOGE(TAG, "Failed to persist default admin user!");
-        }
-
-        static uint8_t parse_roles_csv(const char *roles_str)
-        {
-            if (!roles_str || roles_str[0] == 0) return (uint8_t)Role::Viewer;
-            uint8_t roles = 0;
-            std::string s(roles_str);
-            size_t start = 0;
-            while (start <= s.size())
-            {
-                size_t comma = s.find(',', start);
-                std::string token = s.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-                if (token == "Admin") roles |= (uint8_t)Role::Admin;
-                else if (token == "Operator") roles |= (uint8_t)Role::Operator;
-                else if (token == "Viewer") roles |= (uint8_t)Role::Viewer;
-                if (comma == std::string::npos) break;
-                start = comma + 1;
-            }
-            return roles == 0 ? (uint8_t)Role::Viewer : roles;
-        }
-
-        bool validate_credentials_and_load(const char *username, const char *password, StoredUser &outUser)
-        {
-            if (!username || !password || !is_valid_username(username)) return false;
-            StoredUser user;
-            if (!load_user(username, user)) return false;
-            std::string computedHash = hash_password(user.salt, password);
-            if (!constant_time_equals(computedHash, user.passwordHash)) return false;
-            outUser = user;
-            return true;
-        }
-
-        // Dekodiert application/x-www-form-urlencoded-Text in-place (Standard-Kodierung eines
-        // <form method='POST'>-Submits ohne enctype-Angabe): '+' -> Leerzeichen, '%XX' -> Byte XX.
-        // Fehlte bisher komplett in handle_login_post() -- Benutzername/Passwort mit Sonderzeichen
-        // (Leerzeichen, '&', '=', Nicht-ASCII wie Umlaute) kamen dadurch percent-kodiert im
-        // Rohtext an und matchten nie gegen den echten (dekodierten) gespeicherten Wert. Reine
-        // ASCII-Buchstaben/Ziffern sind vom Encoding nicht betroffen, das hat den Bug lange
-        // verdeckt (s. Log in handle_login_post).
-        static void url_decode(char *s)
-        {
-            char *dst = s;
-            while (*s)
-            {
-                if (*s == '+')
-                {
-                    *dst++ = ' ';
-                    s++;
-                }
-                else if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2]))
-                {
-                    char hex[3] = {s[1], s[2], 0};
-                    *dst++ = (char)strtol(hex, nullptr, 16);
-                    s += 3;
-                }
-                else
-                {
-                    *dst++ = *s++;
-                }
-            }
-            *dst = '\0';
-        }
-
-        static std::string generate_random_token()
-        {
-            char token[33];
-            uint8_t random_bytes[16];
-            esp_fill_random(random_bytes, sizeof(random_bytes));
-
-            for (int i = 0; i < 16; i++) {
-                snprintf(&token[i*2], 3, "%02x", random_bytes[i]);
-            }
-            token[32] = '\0';
-            return std::string(token);
-        }
-
-        // Legt einen neuen Session-Slot fuer 'user' an (verdraengt bei vollem Session-Array den Slot mit
-        // der aeltesten Ablaufzeit -- ausreichend fuer die erwartete Nutzerzahl dieses Geraets, kein
-        // Grund fuer eine dynamische Datenstruktur).
-        std::string create_session(const StoredUser &user)
-        {
-            xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
-            int slot = -1;
-            for (size_t i = 0; i < MAX_SESSIONS; i++)
-                if (!sessions[i].InUse()) { slot = (int)i; break; }
-            if (slot == -1)
-            {
-                size_t oldest = 0;
-                for (size_t i = 1; i < MAX_SESSIONS; i++)
-                    if (sessions[i].expiry_us < sessions[oldest].expiry_us) oldest = i;
-                slot = (int)oldest;
-            }
-            sessions[slot].token = generate_random_token();
-            sessions[slot].username = user.username;
-            sessions[slot].roles = user.roles;
-            sessions[slot].expiry_us = esp_timer_get_time() + SESSION_MAX_AGE_US;
-            std::string token = sessions[slot].token;
-            xSemaphoreGive(webmanager_semaphore);
-            ESP_LOGI(TAG, "Session created for user '%s' (roles=0x%02x)", user.username.c_str(), user.roles);
-            return token;
-        }
-
-        static bool extract_session_token(const char *cookie_header, char (&out_token_buf)[33])
-        {
-            out_token_buf[0] = 0;
-            if (!cookie_header) return false;
-            const char *session_cookie = strstr(cookie_header, "session=");
-            if (!session_cookie) return false;
-            session_cookie += 8; // strlen("session=")
-            sscanf(session_cookie, "%32s", out_token_buf);
-            return out_token_buf[0] != 0;
-        }
-
-        // Bei Erfolg: outUsername/outRoles befuellt UND die serverseitige Ablaufzeit des Slots wird
-        // verlaengert ("sliding renewal", s. SESSION_MAX_AGE_US) -- Aufrufer, die den Browser ebenfalls
-        // laenger eingeloggt halten wollen, muessen zusaetzlich ein frisches Set-Cookie schicken (s.
-        // set_session_cookies(), aufgerufen von handle_webmanager_get()/handle_login_post()).
-        bool validate_session_token(const char *cookie_header, std::string &outUsername, uint8_t &outRoles)
-        {
-            char token_buf[33];
-            if (!extract_session_token(cookie_header, token_buf)) return false;
-
-            xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
-            time_t now = esp_timer_get_time();
-            bool valid = false;
-            for (size_t i = 0; i < MAX_SESSIONS; i++)
-            {
-                if (sessions[i].InUse() && sessions[i].token == token_buf && now < sessions[i].expiry_us)
-                {
-                    outUsername = sessions[i].username;
-                    outRoles = sessions[i].roles;
-                    sessions[i].expiry_us = now + SESSION_MAX_AGE_US;
-                    valid = true;
-                    break;
-                }
-            }
-            xSemaphoreGive(webmanager_semaphore);
-            return valid;
-        }
-
-        void invalidate_session_by_token(const char *token)
-        {
-            if (!token || !token[0]) return;
-            xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
-            for (size_t i = 0; i < MAX_SESSIONS; i++)
-                if (sessions[i].InUse() && sessions[i].token == token) sessions[i].token.clear();
-            xSemaphoreGive(webmanager_semaphore);
-            ESP_LOGI(TAG, "Session invalidated");
-        }
-
-        // Fuer sofortigen Widerruf bei Passwortaenderung/Loeschen eines Nutzers ("ueberall abmelden") --
-        // ohne dafuer bei jeder Session-Validierung zusaetzlich die Nutzerdatei erneut von der SPIFFS-
-        // Partition lesen zu muessen (s. Kommentar bei UserRecord.Epoch im Schema).
-        void invalidate_all_sessions_for_user(const std::string &username)
-        {
-            xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
-            for (size_t i = 0; i < MAX_SESSIONS; i++)
-                if (sessions[i].InUse() && sessions[i].username == username) sessions[i].token.clear();
-            xSemaphoreGive(webmanager_semaphore);
-        }
-
-        // Setzt/erneuert beide Cookies mit einer an SESSION_MAX_AGE_US gekoppelten Lebensdauer, sodass
-        // der Browser den Login geraeteuebergreifend merkt und beim naechsten Besuch automatisch (ohne
-        // erneute Passwortabfrage) wieder anmeldet, solange das Cookie nicht abgelaufen ist. 'Secure'
-        // ist unbedenklich, da dieser Server ausschliesslich ueber HTTPS erreichbar ist (s. main.cc).
-        //
-        // WICHTIG: httpd_resp_set_hdr() kopiert den value-String NICHT, sondern merkt sich nur den
-        // Pointer -- er muss bis zum tatsaechlichen httpd_resp_send()/sendstr() gueltig bleiben (s.
-        // Doku in esp_http_server.h). Deshalb schreiben wir hier in Puffer, die der AUFRUFER auf
-        // seinem eigenen Stackframe haelt (statt in lokale Puffer dieser Funktion, die nach Rueckkehr
-        // ungueltig waeren und von nachfolgenden Aufrufen wie httpd_resp_set_status()/sendstr()
-        // ueberschrieben wuerden -- genau das fuehrte zuvor zu einem kaputten Set-Cookie-Header und
-        // damit dazu, dass der Login serverseitig erfolgreich war, aber der Browser keine gueltige
-        // Session-Cookie erhielt).
-        void set_session_cookies(httpd_req_t *req, const std::string &token, const std::string &username,
-                                  char (&session_cookie_buf)[160], char (&username_cookie_buf)[160])
-        {
-            long long maxAgeSeconds = (long long)(SESSION_MAX_AGE_US / 1000000);
-            snprintf(session_cookie_buf, sizeof(session_cookie_buf),
-                "session=%s; Path=/; Max-Age=%lld; HttpOnly; Secure; SameSite=Strict", token.c_str(), maxAgeSeconds);
-            httpd_resp_set_hdr(req, "Set-Cookie", session_cookie_buf);
-            snprintf(username_cookie_buf, sizeof(username_cookie_buf),
-                "username=%s; Path=/; Max-Age=%lld; Secure; SameSite=Strict", username.c_str(), maxAgeSeconds);
-            httpd_resp_set_hdr(req, "Set-Cookie", username_cookie_buf);
-        }
-
-        // Fuer Admin-only-Endpunkte: liest+validiert das Session-Cookie und prueft, ob die Rolle gesetzt
-        // ist; schreibt bei Misserfolg selbst eine 401/403-Antwort. Rueckgabewert false => Aufrufer muss
-        // sofort ESP_FAIL zurueckgeben, Response ist bereits versendet. outUsername ist der zur
-        // validierten Session gehoerende Nutzername (fuer Audit-Logging in den Aufrufern) -- ABSICHTLICH
-        // NICHT GetCurrentSessionUsername() (das ist der Nutzer der aktuell offenen Websocket-
-        // Verbindung, die von diesem HTTP-Request unabhaengig ist).
-        bool require_role(httpd_req_t *req, Role required, std::string &outUsername)
-        {
-            char cookie_buf[256] = {0};
-            uint8_t roles = 0;
-            if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) != ESP_OK ||
-                !validate_session_token(cookie_buf, outUsername, roles))
-            {
-                httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
-                return false;
-            }
-            if (!(roles & (uint8_t)required))
-            {
-                ESP_LOGW(TAG, "User '%s' (roles=0x%02x) lacks required role 0x%02x", outUsername.c_str(), roles, (uint8_t)required);
-                httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Forbidden");
-                return false;
-            }
-            return true;
-        }
-
-        // Client kann das "session"-Cookie NICHT selbst per document.cookie loeschen, weil es
-        // HttpOnly gesetzt ist (bewusst, s. handle_login_post -- schuetzt vor Diebstahl per XSS) --
-        // das war bislang der einzige Ort, an dem "abgemeldet" versucht wurde (rein clientseitig,
-        // s. app_controller.ts), wirkungslos: das Cookie blieb gueltig, ein Reload auf "/" zeigte
-        // wieder die (weiterhin authentifizierte) SPA statt der Login-Maske. Einziger Weg, ein
-        // HttpOnly-Cookie zu loeschen: der Server selbst schickt ein neues Set-Cookie mit
-        // abgelaufenem Datum.
-        esp_err_t handle_logout_post(httpd_req_t *req)
-        {
-            ESP_LOGI(TAG, "Logout requested");
-            char cookie_buf[256] = {0};
-            if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK)
-            {
-                char token_buf[33];
-                if (extract_session_token(cookie_buf, token_buf)) invalidate_session_by_token(token_buf);
-            }
-            httpd_resp_set_hdr(req, "Set-Cookie", "session=; Path=/; HttpOnly; Secure; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
-            httpd_resp_set_hdr(req, "Set-Cookie", "username=; Path=/; Secure; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
-            httpd_resp_set_status(req, "303 See Other");
-            httpd_resp_set_hdr(req, "Location", "/");
-            httpd_resp_sendstr(req, "");
-            return ESP_OK;
-        }
-
-        // --- Admin-only Nutzerverwaltung (Role::Admin) -----------------------------------------------
-        // Bewusst schlicht (text/plain, kein JSON-Parser im Projekt, form-urlencoded wie /login) statt
-        // einer grafischen Oberflaeche -- kann bei Bedarf spaeter um eine SPA-Seite ergaenzt werden.
-
-        esp_err_t handle_admin_users_get(httpd_req_t *req)
-        {
-            std::string adminUsername;
-            if (!require_role(req, Role::Admin, adminUsername)) return ESP_FAIL;
-            httpd_resp_set_type(req, "text/plain; charset=utf-8");
-            for (auto &name : list_usernames())
-            {
-                StoredUser u;
-                if (!load_user(name, u)) continue;
-                char line[128];
-                snprintf(line, sizeof(line), "%s\troles=0x%02x\n", u.username.c_str(), u.roles);
-                httpd_resp_sendstr_chunk(req, line);
-            }
-            httpd_resp_sendstr_chunk(req, nullptr);
-            return ESP_OK;
-        }
-
-        // Legt einen Nutzer an oder aktualisiert ihn (Passwort + Rollen werden dabei immer komplett
-        // ersetzt). Formular-Felder wie bei /login: username, password, roles (kommasepariert aus
-        // Admin/Operator/Viewer, z.B. "Admin,Operator"; leer/fehlend => Viewer).
-        esp_err_t handle_admin_users_post(httpd_req_t *req)
-        {
-            std::string adminUsername;
-            if (!require_role(req, Role::Admin, adminUsername)) return ESP_FAIL;
-
-            char buf[256] = {0};
-            size_t recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
-            if (recv_len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request"); return ESP_FAIL; }
-
-            char username[64] = {0}, password[64] = {0}, roles_str[64] = {0};
-            char *user_ptr = strstr(buf, "username=");
-            char *pass_ptr = strstr(buf, "password=");
-            char *roles_ptr = strstr(buf, "roles=");
-            if (!user_ptr || !pass_ptr) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing username/password"); return ESP_FAIL; }
-            user_ptr += 9; pass_ptr += 9;
-            sscanf(user_ptr, "%63[^&]", username);
-            sscanf(pass_ptr, "%63[^&]", password);
-            url_decode(username);
-            url_decode(password);
-            if (roles_ptr) { roles_ptr += 6; sscanf(roles_ptr, "%63[^&]", roles_str); url_decode(roles_str); }
-
-            if (!is_valid_username(username)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid username (only a-zA-Z0-9_- allowed)"); return ESP_FAIL; }
-            if (strlen(password) < 8) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password too short (min. 8 characters)"); return ESP_FAIL; }
-
-            uint8_t roles = parse_roles_csv(roles_str);
-
-            StoredUser existing;
-            bool existed = load_user(username, existing);
-            if (existed && (existing.roles & (uint8_t)Role::Admin) && !(roles & (uint8_t)Role::Admin) && count_admins() <= 1)
-            {
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Cannot remove the Admin role from the last remaining admin user");
-                return ESP_FAIL;
-            }
-
-            StoredUser user;
-            user.username = username;
-            user.salt = generate_salt_hex();
-            user.passwordHash = hash_password(user.salt, password);
-            user.roles = roles;
-            user.epoch = existed ? existing.epoch + 1 : 0;
-            if (!save_user(user)) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save user"); return ESP_FAIL; }
-            if (existed) invalidate_all_sessions_for_user(username); // Passwort/Rollen geaendert -> bestehende Sessions dieses Nutzers verwerfen
-            ESP_LOGI(TAG, "Admin '%s': user '%s' %s (roles=0x%02x)", adminUsername.c_str(), username, existed ? "updated" : "created", roles);
-            httpd_resp_sendstr(req, "OK");
-            return ESP_OK;
-        }
-
-        esp_err_t handle_admin_users_delete_post(httpd_req_t *req)
-        {
-            std::string adminUsername;
-            if (!require_role(req, Role::Admin, adminUsername)) return ESP_FAIL;
-
-            char buf[128] = {0};
-            size_t recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
-            if (recv_len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request"); return ESP_FAIL; }
-            char username[64] = {0};
-            char *user_ptr = strstr(buf, "username=");
-            if (!user_ptr) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing username"); return ESP_FAIL; }
-            user_ptr += 9;
-            sscanf(user_ptr, "%63[^&]", username);
-            url_decode(username);
-
-            StoredUser target;
-            if (load_user(username, target) && (target.roles & (uint8_t)Role::Admin) && count_admins() <= 1)
-            {
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Cannot delete the last remaining admin user");
-                return ESP_FAIL;
-            }
-            if (!delete_user(username)) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "User not found"); return ESP_FAIL; }
-            invalidate_all_sessions_for_user(username);
-            ESP_LOGI(TAG, "Admin '%s': user '%s' deleted", adminUsername.c_str(), username);
-            httpd_resp_sendstr(req, "OK");
-            return ESP_OK;
-        }
-
-        esp_err_t handle_login_form(httpd_req_t *req)
-        {
-            const char *html = 
-                "<!DOCTYPE html>"
-                "<html lang='de'>"
-                "<head>"
-                "<meta charset='UTF-8'>"
-                "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-                "<title>Webmanager Login</title>"
-                "<link href='https://fonts.googleapis.com/css?family=Dosis:400,700' rel='stylesheet'>"
-                "<style>"
-                ":root { --blue-rich: #0066cc; --blue-4: hsl(211, 39%, 44%); --main-white: #f2f2f2; }"
-                "*{margin:0;padding:0;box-sizing:border-box;}"
-                "body { font-family: 'Dosis', sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: linear-gradient(135deg, var(--blue-4) 0%, var(--blue-rich) 100%); padding: 20px; }"
-                ".login-container { background: var(--main-white); padding: 3rem 2rem; border-radius: 8px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); width: 100%; max-width: 420px; }"
-                "h1 { text-align: center; color: var(--blue-rich); margin-bottom: 2rem; font-size: 28px; font-weight: 700; }"
-                ".form-group { margin-bottom: 1.5rem; }"
-                "label { display: block; margin-bottom: 0.6rem; color: #333; font-weight: 500; font-size: 14px; }"
-                "input[type='text'], input[type='password'] { width: 100%; padding: 0.75rem 1rem; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; font-family: 'Dosis', sans-serif; transition: border-color 0.2s ease-out, box-shadow 0.2s ease-out; }"
-                "input[type='text']:focus, input[type='password']:focus { outline: none; border-color: var(--blue-rich); box-shadow: 0 0 5px rgba(0, 102, 204, 0.3); }"
-                "button { width: 100%; padding: 0.75rem; background: var(--blue-rich); color: white; border: none; border-radius: 4px; font-size: 14px; font-weight: 700; font-family: 'Dosis', sans-serif; cursor: pointer; transition: background-color 0.2s ease-out, transform 0.1s ease-out; }"
-                "button:hover { background: var(--blue-4); }"
-                "button:active { transform: scale(0.98); }"
-                ".error { color: #dc3545; text-align: center; margin-bottom: 1rem; font-weight: 500; }"
-                "@media (max-width: 480px) { .login-container { padding: 2rem 1.5rem; } h1 { font-size: 24px; } input { font-size: 16px; } }"
-                "</style>"
-                "</head>"
-                "<body>"
-                "<div class='login-container'>"
-                "<h1>Webmanager Login</h1>"
-                "<form method='POST' action='/login'>"
-                "<div class='form-group'>"
-                "<label for='username'>Benutzername:</label>"
-                "<input type='text' id='username' name='username' autocomplete='username' required autofocus>"
-                "</div>"
-                "<div class='form-group'>"
-                "<label for='password'>Kennwort:</label>"
-                "<input type='password' id='password' name='password' autocomplete='current-password' required>"
-                "</div>"
-                "<button type='submit'>Anmelden</button>"
-                "</form>"
-                "</div>"
-                "</body>"
-                "</html>";
-            
-            httpd_resp_set_type(req, "text/html; charset=utf-8");
-            httpd_resp_sendstr(req, html);
-            return ESP_OK;
-        }
-
-        esp_err_t handle_login_post(httpd_req_t *req)
-        {
-            char buf[256] = {0};
-            size_t recv_len = httpd_req_recv(req, buf, sizeof(buf) - 1);
-            if (recv_len <= 0) {
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request");
-                return ESP_FAIL;
-            }
-
-            char username[64] = {0};
-            char password[64] = {0};
-
-            // Parse form data: username=...&password=...
-            char *user_ptr = strstr(buf, "username=");
-            char *pass_ptr = strstr(buf, "password=");
-
-            if (!user_ptr || !pass_ptr) {
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing credentials");
-                return ESP_FAIL;
-            }
-
-            user_ptr += 9; // strlen("username=")
-            pass_ptr += 9; // strlen("password=")
-
-            sscanf(user_ptr, "%63[^&]", username);
-            sscanf(pass_ptr, "%63[^&]", password);
-            url_decode(username);
-            url_decode(password);
-            ESP_LOGI(TAG, "Login attempt for user '%s' (password length %d after url-decode)", username, (int)strlen(password));
-
-            // Validate credentials against the user store (/spiffs/users/<username>.bin)
-            StoredUser user;
-            if (validate_credentials_and_load(username, password, user)) {
-                ESP_LOGI(TAG, "Login successful for user '%s'", username);
-                std::string token = create_session(user);
-                char session_cookie_buf[160];
-                char username_cookie_buf[160];
-                set_session_cookies(req, token, user.username, session_cookie_buf, username_cookie_buf);
-                httpd_resp_set_status(req, "303 See Other");
-                httpd_resp_set_hdr(req, "Location", "/");
-                httpd_resp_sendstr(req, "");
-                return ESP_OK;
-            }
-
-            ESP_LOGW(TAG, "Login failed for user '%s'", username);
-            httpd_resp_set_type(req, "text/html; charset=utf-8");
-            httpd_resp_sendstr(req, 
-                "<!DOCTYPE html>"
-                "<html lang='de'>"
-                "<head>"
-                "<meta charset='UTF-8'>"
-                "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-                "<link href='https://fonts.googleapis.com/css?family=Dosis:400,700' rel='stylesheet'>"
-                "<style>"
-                ":root { --blue-rich: #0066cc; --blue-4: hsl(211, 39%, 44%); --main-white: #f2f2f2; }"
-                "*{margin:0;padding:0;box-sizing:border-box;}"
-                "body { font-family: 'Dosis', sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: linear-gradient(135deg, var(--blue-4) 0%, var(--blue-rich) 100%); padding: 20px; }"
-                ".error-container { background: var(--main-white); padding: 3rem 2rem; border-radius: 8px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); width: 100%; max-width: 420px; text-align: center; }"
-                "h2 { color: #dc3545; margin-bottom: 1rem; font-size: 24px; font-weight: 700; }"
-                "p { color: #666; margin-bottom: 2rem; font-size: 14px; }"
-                "a { text-decoration: none; }"
-                "button { padding: 0.75rem 2rem; background: var(--blue-rich); color: white; border: none; border-radius: 4px; font-size: 14px; font-weight: 700; font-family: 'Dosis', sans-serif; cursor: pointer; transition: background-color 0.2s ease-out; }"
-                "button:hover { background: var(--blue-4); }"
-                "</style>"
-                "</head>"
-                "<body>"
-                "<div class='error-container'>"
-                "<h2>Authentifizierung fehlgeschlagen</h2>"
-                "<p>Benutzername oder Kennwort ist ungültig.</p>"
-                "<a href='/'><button>Zurück zum Login</button></a>"
-                "</div>"
-                "</body>"
-                "</html>");
-            return ESP_OK;
-        }
-
-        esp_err_t handle_webmanager_get(httpd_req_t *req)
-        {
-            // Check for valid session cookie
-            char cookie_buf[256] = {0};
-            if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK)
-            {
-                std::string username;
-                uint8_t roles = 0;
-                if (validate_session_token(cookie_buf, username, roles))
-                {
-                    ESP_LOGI(TAG, "User '%s' authenticated via session token", username.c_str());
-                    // Sliding renewal: bei jedem Seitenaufruf ein frisches Set-Cookie, damit der Browser
-                    // den Login effektiv dauerhaft merkt, solange er regelmaessig genutzt wird (s.
-                    // set_session_cookies()).
-                    char token_buf[33];
-                    extract_session_token(cookie_buf, token_buf);
-                    char session_cookie_buf[160];
-                    char username_cookie_buf[160];
-                    set_session_cookies(req, token_buf, username, session_cookie_buf, username_cookie_buf);
-                    httpd_resp_set_type(req, "text/html");
-                    httpd_resp_set_hdr(req, "Content-Encoding", "br");
-                    httpd_resp_send(req, webmanager_html_br_start, webmanager_html_br_length);
-                    return ESP_OK;
-                }
-            }
-
-            // No valid session: show login form
-            ESP_LOGI(TAG, "Showing login form (no valid session)");
-            return handle_login_form(req);
-        }
-
     public:
         static M *GetSingleton()
         {
@@ -1750,23 +541,16 @@ namespace webmanager
             return this->staConnectionState;
         }
 
-        // Rollen des Nutzers der aktuell offenen Websocket-Verbindung (0, falls keine offen ist) --
-        // fuer Plugins/Message-Handler, die bestimmte Requests auf bestimmte Rollen einschraenken wollen
-        // (z.B. "nur Admin/Operator duerfen schreiben"). Rollen-Bitmaske s. WsProtocol::usermanagement::Role.
-        uint8_t GetCurrentSessionRoles() const { return current_ws_roles; }
-        const std::string &GetCurrentSessionUsername() const { return current_ws_username; }
-
-        const char *GetHostname()
+        // Einheitliche Statusabfrage ueber einen aWebmanagerBase* (s. Basisklasse) -- identischer
+        // Zustand wie GetStaState().
+        bool IsNetworkUp() const override
         {
-            esp_netif_get_hostname(this->wifi_netif_sta, &hostname);
-            return hostname;
+            return this->staConnectionState;
         }
 
-        esp_ip4_addr_t GetIpAddress()
-        {  
-            esp_netif_ip_info_t  ip={};
-            esp_netif_get_ip_info(this->wifi_netif_sta, &ip);
-            return ip.ip;
+        esp_netif_t *GetPrimaryNetif() override
+        {
+            return this->wifi_netif_sta;
         }
 
         const char *GetSsid()
@@ -1774,179 +558,17 @@ namespace webmanager
             return (const char *)this->wifi_config_sta.sta.ssid;
         }
 
-        bool HasRealtime()
+        esp_err_t BringUpNetwork() override
         {
-            struct timeval tv_now;
-            gettimeofday(&tv_now, nullptr);
-            time_t seconds_epoch = tv_now.tv_sec;
-            return seconds_epoch > 1684412222; // epoch time when this code has been written
-        }
-
-        esp_err_t SendRawAsync(const uint8_t* data, size_t len) override
-        {
-            if (!http_server)
-                return ESP_FAIL;
-            if (websocket_file_descriptor == -1)
-            {
-                ESP_LOGD(TAG, "SendRawAsync: no active websocket connection (fd==-1), dropping %d bytes", (int)len);
-                return ESP_ERR_INVALID_STATE;
-            }
-            auto *a = new AsyncResponse(data, len);
-            esp_err_t ret = httpd_queue_work(http_server, M::ws_async_send, a);
-            if (ret != ESP_OK)
-            {
-                ESP_LOGW(TAG, "SendRawAsync: httpd_queue_work failed with %s (fd=%d)", esp_err_to_name(ret), (int)websocket_file_descriptor);
-                delete (a);
-                if (ret == ESP_ERR_INVALID_ARG || ret == ESP_FAIL)
-                {
-                    websocket_file_descriptor = -1;
-                }
-            }
-            return ret;
-        }
-
-        void RegisterHTTPDHandlers(httpd_handle_t httpd_handle)
-        {
-            httpd_uri_t files_get = {
-                FILES_GLOB,
-                HTTP_GET,
-                [](httpd_req_t *req)
-                { return static_cast<M *>(req->user_ctx)->handle_files_get(req); },
-                this, false, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &files_get));
-
-            httpd_uri_t files_post = {
-                FILES_GLOB,
-                HTTP_POST,
-                [](httpd_req_t *req)
-                { return static_cast<M *>(req->user_ctx)->handle_files_post(req); },
-                this, false, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &files_post));
-
-            httpd_uri_t files_delete = {
-                FILES_GLOB,
-                HTTP_DELETE,
-                [](httpd_req_t *req)
-                { return static_cast<M *>(req->user_ctx)->handle_files_delete(req); },
-                this, false, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &files_delete));
-
-            httpd_uri_t ota_post = {
-                "/ota",
-                HTTP_POST,
-                [](httpd_req_t *req)
-                { return static_cast<M *>(req->user_ctx)->handle_ota_post(req); },
-                this, false, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &ota_post));
-            
-            httpd_uri_t login_post = {
-                "/login",
-                HTTP_POST,
-                [](httpd_req_t *req)
-                { return static_cast<M *>(req->user_ctx)->handle_login_post(req); },
-                this, false, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &login_post));
-
-            httpd_uri_t logout_post = {
-                "/logout",
-                HTTP_POST,
-                [](httpd_req_t *req)
-                { return static_cast<M *>(req->user_ctx)->handle_logout_post(req); },
-                this, false, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &logout_post));
-
-            httpd_uri_t admin_users_get = {
-                "/admin/users",
-                HTTP_GET,
-                [](httpd_req_t *req)
-                { return static_cast<M *>(req->user_ctx)->handle_admin_users_get(req); },
-                this, false, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &admin_users_get));
-
-            httpd_uri_t admin_users_post = {
-                "/admin/users",
-                HTTP_POST,
-                [](httpd_req_t *req)
-                { return static_cast<M *>(req->user_ctx)->handle_admin_users_post(req); },
-                this, false, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &admin_users_post));
-
-            httpd_uri_t admin_users_delete_post = {
-                "/admin/users_delete",
-                HTTP_POST,
-                [](httpd_req_t *req)
-                { return static_cast<M *>(req->user_ctx)->handle_admin_users_delete_post(req); },
-                this, false, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &admin_users_delete_post));
-
-            httpd_uri_t webmanager_ws = {
-                "/webmanager_ws",
-                HTTP_GET,
-                [](httpd_req_t *req)
-                { return static_cast<webmanager::M *>(req->user_ctx)->handle_webmanager_ws(req); }, this, true, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &webmanager_ws));
-            
-            httpd_uri_t webmanager_get = {
-                "/*", HTTP_GET,
-                [](httpd_req_t *req)
-                { return static_cast<M *>(req->user_ctx)->handle_webmanager_get(req); },
-                this, false, false, nullptr};
-            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &webmanager_get));
-            this->http_server = httpd_handle;
-        }
-
-
-
-        esp_err_t Begin(const char *accessPointSsid, const char *accessPointPassword, const char *hostname, bool resetStoredWifiConnection, std::vector<iWebmanagerPlugin *> *plugins, bool init_netif_and_create_event_loop = true, bool startOwnSupervisorTask=true, esp_log_level_t wifiLogLevel=ESP_LOG_WARN, const char *auth_username_param="admin", const char *auth_password_param="password", time_t apFallbackTimeout_us_param=FAR_FUTURE)
-        {
-            ESP_LOGI(TAG, "Stating Webmanager");
-            this->apFallbackTimeout_us = apFallbackTimeout_us_param;
-
-            this->hostname=hostname;
-            this->bootstrap_admin_username=auth_username_param;
-            this->bootstrap_admin_password=auth_password_param;
-            bootstrap_default_admin_if_user_store_empty();
-
-            if (strlen(accessPointPassword) < 8 && AP_AUTHMODE != WIFI_AUTH_OPEN){
-                ESP_LOGE(TAG, "Password too short for authentication. Minimal length is 8. Exiting Webmanager");
-                return ESP_FAIL;
-            }
-
-            if (webmanager_semaphore != nullptr){
-                ESP_LOGE(TAG, "webmanager already started. Exiting 'Begin'-method");
-                return ESP_FAIL;
-            }
-            
-            webmanager_semaphore = xSemaphoreCreateBinary();
-            xSemaphoreGive(webmanager_semaphore);
-
-            if (init_netif_and_create_event_loop)
-            {
-                ESP_ERROR_CHECK(esp_netif_init());
-                // Manche HALs (z.B. hal_sensactHsNano3.hh fuer den W5500-Ethernet-Anschluss) rufen
-                // esp_event_loop_create_default() bereits vor Begin() auf. esp_netif_init() ist
-                // idempotent, esp_event_loop_create_default() dagegen nicht (liefert
-                // ESP_ERR_INVALID_STATE bei einem zweiten Aufruf) -- das ist hier kein Fehler.
-                esp_err_t err = esp_event_loop_create_default();
-                if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
-                {
-                    ESP_ERROR_CHECK(err);
-                }
-            }
-
-            this->plugins = plugins;
-
             // Create and check netifs
             wifi_netif_sta = esp_netif_create_default_wifi_sta();
             wifi_netif_ap = esp_netif_create_default_wifi_ap();
             assert(wifi_netif_sta);
             assert(wifi_netif_ap);
 
-            // attach event handler for wifi & ip
+            // attach event handler for wifi (ip is attached generically by the base class)
             ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, [](void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
                                                                 { static_cast<webmanager::M *>(arg)->wifi_event_handler(event_base, event_id, event_data); }, this, nullptr));
-            ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, [](void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
-                                                                { static_cast<webmanager::M *>(arg)->ip_event_handler(event_base, event_id, event_data); }, this, nullptr));
 
             // init WIFI base
             wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -1964,34 +586,19 @@ namespace webmanager
             wifi_config_ap.ap.channel = 0;
             wifi_config_ap.ap.max_connection = 1;
             wifi_config_ap.ap.authmode = AP_AUTHMODE;
-            std::strcpy((char *)(wifi_config_ap.ap.ssid), accessPointSsid);
-            std::strcpy((char *)(wifi_config_ap.ap.password), accessPointPassword);
-            
 
-            ESP_ERROR_CHECK(esp_netif_set_hostname(wifi_netif_sta, hostname));
+            // Der Hostname des sta-netif wird generisch von der Basisklasse gesetzt (GetPrimaryNetif())
             ESP_ERROR_CHECK(esp_netif_set_hostname(wifi_netif_ap, hostname));
-
-            ESP_ERROR_CHECK(mdns_init());
-            ESP_ERROR_CHECK(mdns_hostname_set(hostname));
-            const char *MDNS_INSTANCE = "ESP32_MDNS_INSTANCE";
-            ESP_ERROR_CHECK(mdns_instance_name_set(MDNS_INSTANCE));
-
-            // set wifi logging 
-            esp_log_level_set("wifi", wifiLogLevel);
 
             // Turn Power Saving off
             ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+            return ESP_OK;
+        }
 
-            // SNTP (simple network time protocol) client and start it, when we got an IP address (see event handler)
-            esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-            esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
-            esp_sntp_setservername(0, "pool.ntp.org");
-            esp_sntp_set_time_sync_notification_cb([](struct timeval *tv)
-                                                   { webmanager::M::GetSingleton()->sntp_handler(); });
-            setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1); // Germany
-            tzset();
+        void StartNetworkStateMachine() override
+        {
             time_t now_us = esp_timer_get_time();
-            if (resetStoredWifiConnection)
+            if (resetStoredWifiConnectionOnStart)
             {
                 ESP_LOGI(TAG, "Forced to delete saved wifi configuration. Starting access point and do an initial scan.");
                 delete_sta_config();
@@ -2012,9 +619,37 @@ namespace webmanager
                 this->setStatus(WorkingState::KEEP_CONNECTION, now_us + COMMON_TIMEOUT_US);
             }
             ESP_ERROR_CHECK(esp_wifi_start());
-            for (const auto &i : *this->plugins)
+        }
+
+        esp_err_t Begin(const char *accessPointSsid, const char *accessPointPassword, const char *hostname, bool resetStoredWifiConnection, std::vector<iWebmanagerPlugin *> *plugins, bool init_netif_and_create_event_loop = true, bool startOwnSupervisorTask=true, esp_log_level_t wifiLogLevel=ESP_LOG_WARN, const char *auth_username_param="admin", const char *auth_password_param="password", time_t apFallbackTimeout_us_param=FAR_FUTURE)
+        {
+            ESP_LOGI(TAG, "Stating Webmanager");
+            this->apFallbackTimeout_us = apFallbackTimeout_us_param;
+            this->resetStoredWifiConnectionOnStart = resetStoredWifiConnection;
+
+            if (strlen(accessPointPassword) < 8 && AP_AUTHMODE != WIFI_AUTH_OPEN){
+                ESP_LOGE(TAG, "Password too short for authentication. Minimal length is 8. Exiting Webmanager");
+                return ESP_FAIL;
+            }
+
+            if (webmanager_semaphore != nullptr){
+                ESP_LOGE(TAG, "webmanager already started. Exiting 'Begin'-method");
+                return ESP_FAIL;
+            }
+
+            webmanager_semaphore = xSemaphoreCreateBinary();
+            xSemaphoreGive(webmanager_semaphore);
+
+            std::strcpy((char *)(wifi_config_ap.ap.ssid), accessPointSsid);
+            std::strcpy((char *)(wifi_config_ap.ap.password), accessPointPassword);
+
+            // set wifi logging
+            esp_log_level_set("wifi", wifiLogLevel);
+
+            esp_err_t ret = BeginBase(hostname, plugins, init_netif_and_create_event_loop, auth_username_param, auth_password_param);
+            if (ret != ESP_OK)
             {
-                i->OnBegin(this);
+                return ret;
             }
 
             ESP_LOGI(TAG, "Webmanager has been succcessfully initialized");
@@ -2026,23 +661,7 @@ namespace webmanager
             return ESP_OK;
         }
 
-        esp_err_t CallMeAfterInitializationToMarkCurrentPartitionAsValid()
-        {
-            /* Mark current app as valid */
-            ESP_LOGI(TAG, "Webmanager marks current Partition as valid");
-            const esp_partition_t *partition = esp_ota_get_running_partition();
-            esp_ota_img_states_t ota_state;
-            if (esp_ota_get_state_partition(partition, &ota_state) == ESP_OK)
-            {
-                if (ota_state == ESP_OTA_IMG_PENDING_VERIFY)
-                {
-                    esp_ota_mark_app_valid_cancel_rollback();
-                }
-            }
-            return ESP_OK;
-        }
-
-        void Supervise(){
+        void Supervise() override {
             xSemaphoreTake(webmanager_semaphore, portMAX_DELAY);
             time_t now_us = esp_timer_get_time();
             ESP_LOGD("WMSV", "timSupervisor_cb {'workingState':'%s', 'tReconnect':%lld, 'tShutdownAp':%lld, 'tTimeout':%lld}",
