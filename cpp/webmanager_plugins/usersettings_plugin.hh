@@ -4,6 +4,11 @@
 #include <type_traits>
 #include <cstring>
 #include <array>
+#include <nvs.h>
+#include <nvs_flash.h>
+#include <common-esp32.hh>
+
+#define TAG "USERSETTINGS"
 
 // Fuer NVS-Speicherung ist der konkrete Settings-Typ (nicht nur der Wire-classId) noetig -- dieses
 // Enum ersetzt das vormalige Flatbuffers-Union-Enum "usersettings::Setting" und wird von GroupCfg/
@@ -81,11 +86,20 @@ public:
     {
         const char *groupKey = req.groupKey;
         const GroupCfg *group = GetGroup(groupKey);
-        RETURN_FAIL_ON_FALSE(group != nullptr, "There is no group with key '%s'", groupKey);
+        if (group == nullptr)
+        {
+            ESP_LOGE(TAG, "handleRequestSetUserSettings: There is no group with key '%s'", groupKey);
+            return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+        }
         ESP_LOGI(TAG, "In handleRequestSetUserSettings for GroupKey %s ItemCount %u", groupKey, group->setting_len);
 
         nvs_handle_t nvs_handle{0};
-        RETURN_ON_ERROR(nvs_open_from_partition(partitionName, group->groupKey, NVS_READWRITE, &nvs_handle));
+        esp_err_t openErr = nvs_open_from_partition(partitionName, group->groupKey, NVS_READWRITE, &nvs_handle);
+        if (openErr != ESP_OK)
+        {
+            ESP_LOGE(TAG, "handleRequestSetUserSettings: nvs_open_from_partition failed: %s", esp_err_to_name(openErr));
+            return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+        }
         ESP_LOGI(TAG, "Successfully opened partition, group: %s with %u items. Updating %u items", group->groupKey, group->setting_len, (unsigned)req.settingsCount);
 
         // Grosszuegig bemessen: bis zu 32 Settings-Keys, je <=32 Zeichen + Nullterminator.
@@ -141,6 +155,19 @@ public:
         return ret;
     }
 
+    esp_err_t SetIntegerSetting(const GroupAndIntegerSetting &s, int32_t value)
+    {
+        nvs_handle_t nvs_handle{0};
+        RETURN_ON_ERROR(nvs_open(s.groupKey, NVS_READWRITE, &nvs_handle));
+        esp_err_t ret = nvs_set_i32(nvs_handle, s.settingkey, value);
+        if (ret == ESP_OK)
+        {
+            nvs_commit(nvs_handle);
+        }
+        nvs_close(nvs_handle);
+        return ret;
+    }
+
     esp_err_t GetStringSetting(const GroupAndStringSetting &s, char *value, size_t maxLen)
     {
         nvs_handle_t nvs_handle{0};
@@ -174,11 +201,20 @@ public:
     {
         const char *groupKey = get.groupKey;
         const GroupCfg *group = GetGroup(groupKey);
-        RETURN_FAIL_ON_FALSE(group != nullptr, "There is no group with key '%s'", groupKey);
+        if (group == nullptr)
+        {
+            ESP_LOGE(TAG, "handleRequestGetUserSettings: There is no group with key '%s'", groupKey);
+            return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+        }
         ESP_LOGI(TAG, "In handleRequestGetUserSettings for GroupKey %s ItemCount %u", groupKey, group->setting_len);
 
         nvs_handle_t nvs_handle{0};
-        RETURN_ON_ERROR(nvs_open_from_partition(partitionName, group->groupKey, NVS_READONLY, &nvs_handle));
+        esp_err_t openErr = nvs_open_from_partition(partitionName, group->groupKey, NVS_READONLY, &nvs_handle);
+        if (openErr != ESP_OK)
+        {
+            ESP_LOGE(TAG, "handleRequestGetUserSettings: nvs_open_from_partition failed: %s", esp_err_to_name(openErr));
+            return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+        }
         ESP_LOGI(TAG, "Successfully opened partition, reading %u items", group->setting_len);
 
         // Grosszuegig bemessen: bis zu 32 Settings, je [classId:u16][settingKey<=32+null][Wert<=32+null].
@@ -284,7 +320,7 @@ public:
     webmanager::eMessageReceiverResult ProvideWebsocketMessage(webmanager::iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint16_t namespaceId, uint16_t messageTypeId, const uint8_t *frame, size_t frameLen) override
     {
         if (namespaceId != WsProtocol::usersettings::NAMESPACE_ID)
-            return eMessageReceiverResult::NOT_FOR_ME;
+            return webmanager::eMessageReceiverResult::NOT_FOR_ME;
 
         switch (messageTypeId)
         {
@@ -308,3 +344,5 @@ public:
         }
     }
 };
+
+#undef TAG
