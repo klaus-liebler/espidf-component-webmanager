@@ -621,9 +621,10 @@ namespace webmanager
             ESP_ERROR_CHECK(esp_wifi_start());
         }
 
-        esp_err_t Begin(const char *accessPointSsid, const char *accessPointPassword, const char *hostname, bool resetStoredWifiConnection, std::vector<iWebmanagerPlugin *> *plugins, bool init_netif_and_create_event_loop = true, bool startOwnSupervisorTask=true, esp_log_level_t wifiLogLevel=ESP_LOG_WARN, const char *auth_username_param="admin", const char *auth_password_param="password", time_t apFallbackTimeout_us_param=FAR_FUTURE)
+        esp_err_t Begin(const char *accessPointSsid, const char *accessPointPassword, const char *hostname, bool resetStoredWifiConnection, std::vector<iWebmanagerPlugin *> *plugins, bool init_netif_and_create_event_loop = true, bool startOwnSupervisorTask=true, esp_log_level_t wifiLogLevel=ESP_LOG_WARN, const char *auth_username_param="admin", const char *auth_password_param="password", time_t apFallbackTimeout_us_param=FAR_FUTURE, bool disable_authentication=false)
         {
             ESP_LOGI(TAG, "Stating Webmanager");
+            this->SetAuthenticationDisabled(disable_authentication);
             this->apFallbackTimeout_us = apFallbackTimeout_us_param;
             this->resetStoredWifiConnectionOnStart = resetStoredWifiConnection;
 

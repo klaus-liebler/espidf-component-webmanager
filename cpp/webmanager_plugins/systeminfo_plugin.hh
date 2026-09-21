@@ -75,9 +75,12 @@ private:
         gettimeofday(&tv_now, nullptr);
 
         float tsens_out{0.0};
+#if CONFIG_SOC_TEMP_SENSOR_SUPPORTED
+        // Der klassische ESP32 hat keinen internen Temperatursensor (Treiber nicht mitgelinkt)
         if(tempHandle){
             ESP_ERROR_CHECK(temperature_sensor_get_celsius(tempHandle, &tsens_out));
         }
+#endif
 
         WsProtocol::systeminfo::ResponseSystemData::Payload resp{};
         resp.requestId = requestId;

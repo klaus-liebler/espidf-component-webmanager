@@ -232,11 +232,9 @@ namespace webmanager
             if (req->method == HTTP_GET)
             {
                 // Validate session token on WebSocket handshake
-                char cookie_buf[256] = {0};
                 std::string username;
                 uint8_t roles = 0;
-                if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) != ESP_OK ||
-                    !validate_session_token(cookie_buf, username, roles))
+                if (!authenticate_request(req, username, roles))
                 {
                     ESP_LOGW(TAG, "WebSocket: No valid session token");
                     httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
@@ -890,6 +888,28 @@ namespace webmanager
         // verlaengert ("sliding renewal", s. SESSION_MAX_AGE_US) -- Aufrufer, die den Browser ebenfalls
         // laenger eingeloggt halten wollen, muessen zusaetzlich ein frisches Set-Cookie schicken (s.
         // set_session_cookies(), aufgerufen von handle_webmanager_get()/handle_login_post()).
+        // Login komplett abgeschaltet (SetAuthenticationDisabled bzw. Begin(..., disable_authentication=true)):
+        // jeder Zugriff gilt als Nutzer "anonymous" mit allen Rollen. NUR fuer Geraete in einem
+        // vertrauenswuerdigen Netz gedacht.
+        bool authenticationDisabled{false};
+        static constexpr const char *ANONYMOUS_USERNAME = "anonymous";
+        static constexpr uint8_t ALL_ROLES = 0xFF;
+
+        // Gemeinsamer Einstieg fuer alle Endpunkte: liest das Session-Cookie (falls vorhanden) und validiert
+        // es; bei abgeschaltetem Login immer erfolgreich.
+        bool authenticate_request(httpd_req_t *req, std::string &outUsername, uint8_t &outRoles)
+        {
+            if (authenticationDisabled)
+            {
+                outUsername = ANONYMOUS_USERNAME;
+                outRoles = ALL_ROLES;
+                return true;
+            }
+            char cookie_buf[256] = {0};
+            return httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK &&
+                   validate_session_token(cookie_buf, outUsername, outRoles);
+        }
+
         bool validate_session_token(const char *cookie_header, std::string &outUsername, uint8_t &outRoles)
         {
             char token_buf[33];
@@ -967,10 +987,8 @@ namespace webmanager
         // Verbindung, die von diesem HTTP-Request unabhaengig ist).
         bool require_role(httpd_req_t *req, Role required, std::string &outUsername)
         {
-            char cookie_buf[256] = {0};
             uint8_t roles = 0;
-            if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) != ESP_OK ||
-                !validate_session_token(cookie_buf, outUsername, roles))
+            if (!authenticate_request(req, outUsername, roles))
             {
                 httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Authentication required");
                 return false;
@@ -1235,6 +1253,15 @@ namespace webmanager
 
         esp_err_t handle_webmanager_get(httpd_req_t *req)
         {
+            if (authenticationDisabled)
+            {
+                // Kein Login: SPA direkt ausliefern; das (nicht-HttpOnly) username-Cookie zeigt die UI im Kopf an.
+                httpd_resp_set_hdr(req, "Set-Cookie", "username=anonymous; Path=/; Secure; SameSite=Strict");
+                httpd_resp_set_type(req, "text/html");
+                httpd_resp_set_hdr(req, "Content-Encoding", "br");
+                httpd_resp_send(req, webmanager_html_br_start, webmanager_html_br_length);
+                return ESP_OK;
+            }
             // Check for valid session cookie
             char cookie_buf[256] = {0};
             if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK)
@@ -1341,6 +1368,13 @@ namespace webmanager
         }
 
     public:
+        // Schaltet den Login ab (s. authenticationDisabled). Vor dem Start des HTTP-Servers aufrufen.
+        void SetAuthenticationDisabled(bool disabled)
+        {
+            authenticationDisabled = disabled;
+            if (disabled) ESP_LOGW(TAG, "Authentication is DISABLED -- everybody with network access has full control!");
+        }
+
         virtual ~aWebmanagerBase() { delete[] http_buffer; }
 
         // Fuer Aufrufer, die nur wissen wollen "die eine, geraeteweite Webmanager-Instanz" (z.B.
