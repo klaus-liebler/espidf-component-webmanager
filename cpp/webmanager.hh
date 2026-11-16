@@ -45,12 +45,11 @@ namespace webmanager
         time_t apFallbackTimeout_us{FAR_FUTURE};
         time_t giveUpAt_us{FAR_FUTURE};
 
-        // Korrelations-ID des zuletzt entgegengenommenen RequestWifiConnect -- wird gebraucht,
-        // weil ResponseWifiConnect asynchron aus wifi_event_handler/ip_event_handler heraus
-        // verschickt wird (nicht direkt aus dem Request-Handler), die requestId des Requests aber
-        // trotzdem unveraendert in der Response zurueckgegeben werden soll (s. Schema-Kommentar
-        // in ws-protocol/wifimanager.cs).
-        uint16_t lastWifiConnectRequestId{0};
+        // Header of the last RequestWifiConnect: ResponseWifiConnect is sent later, from
+        // wifi_event_handler/ip_event_handler (not from the request handler), and must carry the
+        // request's correlation (ResponderFor()). All zero: no request (e.g. the reconnect at boot) - the
+        // response is then a push (correlation 0).
+        WsProtocol::FrameHeader lastWifiConnectRequest{};
 
         // aus Begin() uebernommen, wird erst in StartNetworkStateMachine() ausgewertet
         bool resetStoredWifiConnectionOnStart{false};
@@ -118,26 +117,15 @@ namespace webmanager
         void sendWifiConnectionNotSuccessfulMessage()
         {
             WsProtocol::wifimanager::ResponseWifiConnect::Payload resp{};
-            resp.requestId = lastWifiConnectRequestId;
             resp.success = false;
             resp.ssid = "";
             resp.ip = 0;
             resp.netmask = 0;
             resp.gateway = 0;
             resp.rssi = 0;
+            ESP_LOGI(TAG, "sendWifiConnectionNotSuccessfulMessage: correlation=%d, fd=%d", (int)lastWifiConnectRequest.correlationId, (int)websocket_file_descriptor);
             uint8_t buf[256];
-            size_t len = WsProtocol::wifimanager::ResponseWifiConnect::Encode(resp, buf, sizeof(buf));
-            ESP_LOGI(TAG, "sendWifiConnectionNotSuccessfulMessage: requestId=%d, encoded len=%d, fd=%d", (int)resp.requestId, (int)len, (int)websocket_file_descriptor);
-            if (len > 0)
-            {
-                esp_err_t ret = SendRawAsync(buf, len);
-                // ESP_ERR_INVALID_STATE = kein Websocket-Client verbunden -- passiert erwartbar bei
-                // jedem Boot-Zeit-Autoreconnect zu einer gespeicherten SSID (KEEP_CONNECTION), noch
-                // bevor ueberhaupt ein Browser die Seite geoeffnet hat. Nur andere Fehler sind
-                // tatsaechlich ungewoehnlich.
-                if (ret == ESP_ERR_INVALID_STATE) ESP_LOGD(TAG, "sendWifiConnectionNotSuccessfulMessage: no websocket client connected (yet)");
-                else if (ret != ESP_OK) ESP_LOGW(TAG, "sendWifiConnectionNotSuccessfulMessage: SendRawAsync failed with %s", esp_err_to_name(ret));
-            }
+            ResponderFor(lastWifiConnectRequest, buf, sizeof(buf)).Send(WsProtocol::wifimanager::ResponseWifiConnect::Encode, resp);
         }
 
         void sendWifiConnectionSuccessfulMessage(const esp_netif_ip_info_t *ip){
@@ -147,26 +135,15 @@ namespace webmanager
             // 'ap.rssi' wurde zuvor geholt, aber nie in die Response geschrieben (echter Bug,
             // per Recherche bestaetigt) -- jetzt korrekt gesetzt.
             WsProtocol::wifimanager::ResponseWifiConnect::Payload resp{};
-            resp.requestId = lastWifiConnectRequestId;
             resp.success = true;
             resp.ssid = (const char*)wifi_config_sta.sta.ssid;
             resp.ip = ip->ip.addr;
             resp.netmask = ip->netmask.addr;
             resp.gateway = ip->gw.addr;
             resp.rssi = ap.rssi;
+            ESP_LOGI(TAG, "sendWifiConnectionSuccessfulMessage: correlation=%d, fd=%d", (int)lastWifiConnectRequest.correlationId, (int)websocket_file_descriptor);
             uint8_t buf[256];
-            size_t len = WsProtocol::wifimanager::ResponseWifiConnect::Encode(resp, buf, sizeof(buf));
-            ESP_LOGI(TAG, "sendWifiConnectionSuccessfulMessage: requestId=%d, ssid='%s', ip=%s, encoded len=%d, fd=%d", (int)resp.requestId, resp.ssid, ip4addr_ntoa((const ip4_addr_t*)&ip->ip), (int)len, (int)websocket_file_descriptor);
-            if (len > 0)
-            {
-                esp_err_t ret = SendRawAsync(buf, len);
-                // ESP_ERR_INVALID_STATE = kein Websocket-Client verbunden -- passiert erwartbar bei
-                // jedem Boot-Zeit-Autoreconnect zu einer gespeicherten SSID (KEEP_CONNECTION), noch
-                // bevor ueberhaupt ein Browser die Seite geoeffnet hat. Nur andere Fehler sind
-                // tatsaechlich ungewoehnlich.
-                if (ret == ESP_ERR_INVALID_STATE) ESP_LOGD(TAG, "sendWifiConnectionSuccessfulMessage: no websocket client connected (yet)");
-                else if (ret != ESP_OK) ESP_LOGW(TAG, "sendWifiConnectionSuccessfulMessage: SendRawAsync failed with %s", esp_err_to_name(ret));
-            }
+            ResponderFor(lastWifiConnectRequest, buf, sizeof(buf)).Send(WsProtocol::wifimanager::ResponseWifiConnect::Encode, resp);
         }
 
         esp_err_t delete_sta_config()
@@ -370,29 +347,30 @@ namespace webmanager
         // weil es eng mit der WLAN-State-Machine dieser Klasse verzahnt ist -- funktional aber ein
         // regulaerer iWebmanagerPlugin-Aufruf wie jeder andere Namespace, kein Sonderfall im
         // Dispatcher mehr (anders als vorher).
-        eMessageReceiverResult ProvideWebsocketMessage(iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint16_t namespaceId, uint16_t messageTypeId, const uint8_t *frame, size_t frameLen) override
+        eMessageReceiverResult ProvideWebsocketMessage(iWebmanagerCallback *callback, WsProtocol::Responder &reply, const uint8_t *frame, size_t frameLen) override
         {
-            if (namespaceId != WsProtocol::wifimanager::NAMESPACE_ID)
+            namespace wm = WsProtocol::wifimanager;
+            if (reply.Request().namespaceId != wm::NAMESPACE_ID)
                 return eMessageReceiverResult::NOT_FOR_ME;
-            switch (messageTypeId)
+            switch (reply.Request().messageTypeId)
             {
-            case WsProtocol::wifimanager::RequestNetworkInformation::TYPE_ID:
-                return sendResponseNetworkInformation(frame, frameLen);
-            case WsProtocol::wifimanager::RequestWifiConnect::TYPE_ID:
-                return handleRequestWifiConnect(frame, frameLen);
-            case WsProtocol::wifimanager::RequestWifiDisconnect::TYPE_ID:
-                return handleRequestWifiDisconnect(frame, frameLen);
+            case wm::RequestNetworkInformation::TYPE_ID:
+                return Handle(reply, frame, frameLen, wm::RequestNetworkInformation::Decode,
+                              [this](WsProtocol::Responder &r, const wm::RequestNetworkInformation::Payload &) { return sendResponseNetworkInformation(r); });
+            case wm::RequestWifiConnect::TYPE_ID:
+                return Handle(reply, frame, frameLen, wm::RequestWifiConnect::Decode,
+                              [this](WsProtocol::Responder &r, const wm::RequestWifiConnect::Payload &q) { return handleRequestWifiConnect(r, q); });
+            case wm::RequestWifiDisconnect::TYPE_ID:
+                return Handle(reply, frame, frameLen, wm::RequestWifiDisconnect::Decode,
+                              [this](WsProtocol::Responder &r, const wm::RequestWifiDisconnect::Payload &) { return handleRequestWifiDisconnect(r); });
             default:
-                return eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                return eMessageReceiverResult::NOT_FOR_ME;  // the requester gets UnknownMessage
             }
         }
 
-        eMessageReceiverResult handleRequestWifiConnect(const uint8_t *frame, size_t frameLen)
+        eMessageReceiverResult handleRequestWifiConnect(WsProtocol::Responder &reply, const WsProtocol::wifimanager::RequestWifiConnect::Payload &req)
         {
-            WsProtocol::wifimanager::RequestWifiConnect::Payload req{};
-            if (!WsProtocol::wifimanager::RequestWifiConnect::Decode(frame, frameLen, req))
-                return eMessageReceiverResult::FOR_ME_BUT_FAILED;
-            lastWifiConnectRequestId = req.requestId;
+            lastWifiConnectRequest = reply.Request();  // answered later (sendWifiConnection*Message())
 
             [[maybe_unused]] esp_err_t ret{ESP_OK}; // von ESP_GOTO_ON_FALSE unten benoetigt (schreibt "ret = err_code"), Wert wird aber nie gelesen
             time_t now_us{0};
@@ -417,30 +395,20 @@ namespace webmanager
         negativeresponse:
             {
                 WsProtocol::wifimanager::ResponseWifiConnect::Payload resp{};
-                resp.requestId = req.requestId;
                 resp.success = false;
                 resp.ssid = (const char*)wifi_config_sta.sta.ssid;
                 resp.ip = 0;
                 resp.netmask = 0;
                 resp.gateway = 0;
                 resp.rssi = 0;
-                uint8_t buf[256];
-                size_t n = WsProtocol::wifimanager::ResponseWifiConnect::Encode(resp, buf, sizeof(buf));
-                return (n > 0 && SendRawAsync(buf, n) == ESP_OK) ? eMessageReceiverResult::OK : eMessageReceiverResult::FOR_ME_BUT_FAILED;
+                reply.Send(WsProtocol::wifimanager::ResponseWifiConnect::Encode, resp);
+                return eMessageReceiverResult::OK;
             }
         }
 
-        eMessageReceiverResult handleRequestWifiDisconnect(const uint8_t *frame, size_t frameLen)
+        eMessageReceiverResult handleRequestWifiDisconnect(WsProtocol::Responder &reply)
         {
-            WsProtocol::wifimanager::RequestWifiDisconnect::Payload req{};
-            if (!WsProtocol::wifimanager::RequestWifiDisconnect::Decode(frame, frameLen, req))
-                return eMessageReceiverResult::FOR_ME_BUT_FAILED;
-
-            WsProtocol::wifimanager::ResponseWifiDisconnect::Payload resp{};
-            resp.requestId = req.requestId;
-            uint8_t buf[64];
-            size_t len = WsProtocol::wifimanager::ResponseWifiDisconnect::Encode(resp, buf, sizeof(buf));
-            if (len > 0) SendRawAsync(buf, len);
+            reply.Send(WsProtocol::wifimanager::ResponseWifiDisconnect::Encode, WsProtocol::wifimanager::ResponseWifiDisconnect::Payload{});
             vTaskDelay(pdMS_TO_TICKS(2000)); // warte 2s, um die Beantwortung des Requests noch zu ermöglichen
 
             if (!xSemaphoreTake(webmanager_semaphore, portMAX_DELAY))
@@ -453,14 +421,10 @@ namespace webmanager
             return eMessageReceiverResult::OK;
         }
 
-        eMessageReceiverResult sendResponseNetworkInformation(const uint8_t *frame, size_t frameLen)
+        eMessageReceiverResult sendResponseNetworkInformation(WsProtocol::Responder &reply)
         {
-            WsProtocol::wifimanager::RequestNetworkInformation::Payload req{};
-            if (!WsProtocol::wifimanager::RequestNetworkInformation::Decode(frame, frameLen, req))
-                return eMessageReceiverResult::FOR_ME_BUT_FAILED;
-            //bool forceUpdate = req.forceNewSearch;
             ESP_LOGI(TAG, "Prepare to send ResponseNetworkInformation");
-            esp_err_t ret{ESP_OK};
+            [[maybe_unused]] esp_err_t ret{ESP_OK};  // GOTO_ERROR_ON_ERROR writes it; the answer goes out either way
 
             wifi_ap_record_t *ap{nullptr};
             wifi_ap_record_t my_ap={};
@@ -504,7 +468,6 @@ namespace webmanager
             //xSemaphoreGive(webmanager_semaphore);
             {
                 WsProtocol::wifimanager::ResponseNetworkInformation::Payload resp{};
-                resp.requestId = req.requestId;
                 resp.hostname = hostname;
                 resp.ssidAp = (const char*)wifi_config_ap.ap.ssid;
                 resp.passwordAp = (const char*)wifi_config_ap.ap.password;
@@ -519,11 +482,9 @@ namespace webmanager
                 resp.accesspointsCount = ap_appended;
                 resp.accesspointsDataSize = ap_scratch_pos;
 
-                uint8_t buf[1536];
-                size_t len = WsProtocol::wifimanager::ResponseNetworkInformation::Encode(resp, buf, sizeof(buf));
-                ret = (len > 0 && SendRawAsync(buf, len) == ESP_OK) ? ESP_OK : ESP_FAIL;
+                reply.Send(WsProtocol::wifimanager::ResponseNetworkInformation::Encode, resp);
             }
-            return ret == ESP_OK ? eMessageReceiverResult::OK : eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            return eMessageReceiverResult::OK;
         }
 
     public:

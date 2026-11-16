@@ -58,7 +58,7 @@ public class ResponseEnrollNewFinger
 }
 
 /// Server-Push waehrend eines laufenden Enroll-Vorgangs -- Teil der urspruenglichen 'Responses'-Union.
-[BinaryMessage(MessageKind.Response)]
+[BinaryMessage(MessageKind.Event)]
 public class NotifyEnrollNewFinger
 {
 	[BinaryMaxEncodedByteLength(15)] public string Name;
@@ -68,7 +68,7 @@ public class NotifyEnrollNewFinger
 }
 
 /// Server-Push bei erkanntem Finger -- Teil der urspruenglichen 'Responses'-Union.
-[BinaryMessage(MessageKind.Response)]
+[BinaryMessage(MessageKind.Event)]
 public class NotifyFingerDetected
 {
 	public ushort Errorcode;

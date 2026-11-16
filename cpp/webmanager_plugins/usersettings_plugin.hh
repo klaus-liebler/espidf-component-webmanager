@@ -82,7 +82,7 @@ private:
 public:
     UsersettingsPlugin(const char *partitionName) : partitionName(partitionName) {}
 
-    webmanager::eMessageReceiverResult handleRequestSetUserSettings(const WsProtocol::usersettings::RequestSetUserSettings::Payload &req, webmanager::iWebmanagerCallback *callback)
+    webmanager::eMessageReceiverResult handleRequestSetUserSettings(WsProtocol::Responder &reply, const WsProtocol::usersettings::RequestSetUserSettings::Payload &req)
     {
         const char *groupKey = req.groupKey;
         const GroupCfg *group = GetGroup(groupKey);
@@ -134,15 +134,12 @@ public:
         nvs_close(nvs_handle);
 
         WsProtocol::usersettings::ResponseSetUserSettings::Payload resp{};
-        resp.requestId = req.requestId;
         resp.groupKey = groupKey;
         resp.settingKeysData = keys_scratch;
         resp.settingKeysCount = keys_count;
         resp.settingKeysDataSize = keys_pos;
 
-        static uint8_t buf[2048];
-        size_t len = WsProtocol::usersettings::ResponseSetUserSettings::Encode(resp, buf, sizeof(buf));
-        if (len > 0) callback->SendRawAsync(buf, len);
+        reply.Send(WsProtocol::usersettings::ResponseSetUserSettings::Encode, resp);
         return webmanager::eMessageReceiverResult::OK;
     }
 
@@ -197,7 +194,7 @@ public:
         return ret;
     }
 
-    webmanager::eMessageReceiverResult handleRequestGetUserSettings(const WsProtocol::usersettings::RequestGetUserSettings::Payload &get, webmanager::iWebmanagerCallback *callback)
+    webmanager::eMessageReceiverResult handleRequestGetUserSettings(WsProtocol::Responder &reply, const WsProtocol::usersettings::RequestGetUserSettings::Payload &get)
     {
         const char *groupKey = get.groupKey;
         const GroupCfg *group = GetGroup(groupKey);
@@ -299,15 +296,12 @@ public:
         nvs_close(nvs_handle);
 
         WsProtocol::usersettings::ResponseGetUserSettings::Payload resp{};
-        resp.requestId = get.requestId;
         resp.groupKey = groupKey;
         resp.settingsData = settings_scratch;
         resp.settingsCount = settings_count;
         resp.settingsDataSize = settings_pos;
 
-        static uint8_t buf[4096];
-        size_t len = WsProtocol::usersettings::ResponseGetUserSettings::Encode(resp, buf, sizeof(buf));
-        if (len > 0) callback->SendRawAsync(buf, len);
+        reply.Send(WsProtocol::usersettings::ResponseGetUserSettings::Encode, resp);
         return webmanager::eMessageReceiverResult::OK;
     }
 
@@ -317,30 +311,22 @@ public:
     void OnWifiDisconnect(webmanager::iWebmanagerCallback *callback) override { (void)(callback); }
     void OnTimeUpdate(webmanager::iWebmanagerCallback *callback) override { (void)(callback); }
 
-    webmanager::eMessageReceiverResult ProvideWebsocketMessage(webmanager::iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint16_t namespaceId, uint16_t messageTypeId, const uint8_t *frame, size_t frameLen) override
+    webmanager::eMessageReceiverResult ProvideWebsocketMessage(webmanager::iWebmanagerCallback *callback, WsProtocol::Responder &reply, const uint8_t *frame, size_t frameLen) override
     {
-        if (namespaceId != WsProtocol::usersettings::NAMESPACE_ID)
+        namespace us = WsProtocol::usersettings;
+        if (reply.Request().namespaceId != us::NAMESPACE_ID)
             return webmanager::eMessageReceiverResult::NOT_FOR_ME;
 
-        switch (messageTypeId)
+        switch (reply.Request().messageTypeId)
         {
-        case WsProtocol::usersettings::RequestGetUserSettings::TYPE_ID:
-        {
-            WsProtocol::usersettings::RequestGetUserSettings::Payload req{};
-            if (!WsProtocol::usersettings::RequestGetUserSettings::Decode(frame, frameLen, req))
-                return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
-            return handleRequestGetUserSettings(req, callback);
-        }
-        case WsProtocol::usersettings::RequestSetUserSettings::TYPE_ID:
-        {
-            WsProtocol::usersettings::RequestSetUserSettings::Payload req{};
-            if (!WsProtocol::usersettings::RequestSetUserSettings::Decode(frame, frameLen, req))
-                return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
-            return handleRequestSetUserSettings(req, callback);
-        }
-
+        case us::RequestGetUserSettings::TYPE_ID:
+            return webmanager::Handle(reply, frame, frameLen, us::RequestGetUserSettings::Decode,
+                                      [this](WsProtocol::Responder &r, const us::RequestGetUserSettings::Payload &q) { return handleRequestGetUserSettings(r, q); });
+        case us::RequestSetUserSettings::TYPE_ID:
+            return webmanager::Handle(reply, frame, frameLen, us::RequestSetUserSettings::Decode,
+                                      [this](WsProtocol::Responder &r, const us::RequestSetUserSettings::Payload &q) { return handleRequestSetUserSettings(r, q); });
         default:
-            return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            return webmanager::eMessageReceiverResult::NOT_FOR_ME;
         }
     }
 };

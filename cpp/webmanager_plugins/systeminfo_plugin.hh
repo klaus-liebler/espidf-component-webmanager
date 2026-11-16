@@ -17,7 +17,7 @@ private:
         return mac;
     }
 
-    webmanager::eMessageReceiverResult sendResponseSystemData(webmanager::iWebmanagerCallback *callback, uint16_t requestId)
+    webmanager::eMessageReceiverResult sendResponseSystemData(WsProtocol::Responder &reply)
     {
         ESP_LOGI(TAG, "Prepare to send ResponseSystemData");
         const esp_partition_t *running = esp_ota_get_running_partition();
@@ -83,7 +83,6 @@ private:
 #endif
 
         WsProtocol::systeminfo::ResponseSystemData::Payload resp{};
-        resp.requestId = requestId;
         resp.secondsEpoch = tv_now.tv_sec;
         resp.secondsUptime = esp_timer_get_time() / 1000000;
         resp.freeHeap = esp_get_free_heap_size();
@@ -105,9 +104,8 @@ private:
         resp.partitionsCount = partitions_count;
         resp.partitionsDataSize = partitions_pos;
 
-        static uint8_t buf[4096];
-        size_t len = WsProtocol::systeminfo::ResponseSystemData::Encode(resp, buf, sizeof(buf));
-        return (len > 0 && callback->SendRawAsync(buf, len) == ESP_OK) ? webmanager::eMessageReceiverResult::OK : webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+        reply.Send(WsProtocol::systeminfo::ResponseSystemData::Encode, resp);
+        return webmanager::eMessageReceiverResult::OK;
     }
 
 public:
@@ -123,12 +121,12 @@ public:
     void OnWifiConnect(webmanager::iWebmanagerCallback *callback) override { (void)(callback); }
     void OnWifiDisconnect(webmanager::iWebmanagerCallback *callback) override { (void)(callback); }
     void OnTimeUpdate(webmanager::iWebmanagerCallback *callback) override { (void)(callback); }
-    webmanager::eMessageReceiverResult ProvideWebsocketMessage(webmanager::iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint16_t namespaceId, uint16_t messageTypeId, const uint8_t *frame, size_t frameLen) override
+    webmanager::eMessageReceiverResult ProvideWebsocketMessage(webmanager::iWebmanagerCallback *callback, WsProtocol::Responder &reply, const uint8_t *frame, size_t frameLen) override
     {
-        if (namespaceId != WsProtocol::systeminfo::NAMESPACE_ID)
+        if (reply.Request().namespaceId != WsProtocol::systeminfo::NAMESPACE_ID)
             return webmanager::eMessageReceiverResult::NOT_FOR_ME;
 
-        switch (messageTypeId)
+        switch (reply.Request().messageTypeId)
         {
         case WsProtocol::systeminfo::RequestRestart::TYPE_ID:
         {
@@ -141,10 +139,10 @@ public:
             WsProtocol::systeminfo::RequestSystemData::Payload req{};
             if (!WsProtocol::systeminfo::RequestSystemData::Decode(frame, frameLen, req))
                 return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
-            return sendResponseSystemData(callback, req.requestId);
+            return sendResponseSystemData(reply);
         }
         default:
-            return webmanager::eMessageReceiverResult::FOR_ME_BUT_FAILED;
+            return webmanager::eMessageReceiverResult::NOT_FOR_ME;  // the requester gets UnknownMessage
         }
     }
 };

@@ -3,10 +3,8 @@
 #include <cstddef>
 #include <cstring>
 
-// 'data' ist bereits ein vollstaendiger ws-protocol-Frame (4-Byte-Kopf namespaceId:u16+
-// messageTypeId:u16 + Payload, s. generiertes ws_protocol.hh) -- wird unveraendert kopiert,
-// kein zusaetzliches Voranstellen eines Namespace-Praefix mehr noetig (ersetzt den vormaligen,
-// Flatbuffers-spezifischen Konstruktor AsyncResponse(uint32_t ns, FlatBufferBuilder*)).
+// 'data' is a complete frame (8-byte header + payload, see the generated ws_protocol.hh); copied
+// unchanged, so the sender's buffer may be reused at once.
 class AsyncResponse{
     public:
     uint8_t* buffer;

@@ -75,6 +75,11 @@ namespace webmanager
         static inline aWebmanagerBase *instance{nullptr};
 
         uint8_t *http_buffer;
+        // The answer of the request being handled (httpd task; the largest answer of a plugin, the
+        // fingerprint list, needs 8 KB). answered: its Responder has sent something.
+        static constexpr size_t ANSWER_BUFFER_SIZE{8192};
+        uint8_t *answer_buffer;
+        bool answered{false};
         const char *hostname{nullptr};
 
         httpd_handle_t http_server{nullptr};
@@ -129,6 +134,7 @@ namespace webmanager
         aWebmanagerBase()
         {
             http_buffer = new uint8_t[HTTP_BUFFER_SIZE];
+            answer_buffer = new uint8_t[ANSWER_BUFFER_SIZE];
             instance = this;
         }
 
@@ -289,20 +295,22 @@ namespace webmanager
                 delete[] buf;
                 return ret;
             }
-            if (ws_pkt.len < 4)
+            WsProtocol::FrameHeader header{};
+            if (!WsProtocol::ReadHeader(buf, ws_pkt.len, header))
             {
                 ESP_LOGW(TAG, "Ignoring short websocket binary frame (len=%u)", (unsigned)ws_pkt.len);
                 delete[] buf;
                 return ESP_OK;
             }
-            uint16_t namespaceId = (uint16_t)(buf[0] | (buf[1] << 8));
-            uint16_t messageTypeId = (uint16_t)(buf[2] | (buf[3] << 8));
-            eMessageReceiverResult success = ProvideWebsocketMessage(this, req, &ws_pkt, namespaceId, messageTypeId, buf, ws_pkt.len);
+            // one answer at a time (the httpd task): one buffer, SendRawAsync() copies
+            answered = false;
+            WsProtocol::Responder reply(header, answer_buffer, ANSWER_BUFFER_SIZE, send_answer, this);
+            eMessageReceiverResult success = ProvideWebsocketMessage(this, reply, buf, ws_pkt.len);
             if (success == eMessageReceiverResult::NOT_FOR_ME && plugins)
             {
                 for (auto p : *plugins)
                 {
-                    success = p->ProvideWebsocketMessage(this, req, &ws_pkt, namespaceId, messageTypeId, buf, ws_pkt.len);
+                    success = p->ProvideWebsocketMessage(this, reply, buf, ws_pkt.len);
                     if (success != eMessageReceiverResult::NOT_FOR_ME)
                     {
                         break;
@@ -311,11 +319,13 @@ namespace webmanager
             }
             if (success == eMessageReceiverResult::NOT_FOR_ME)
             {
-                ESP_LOGW(TAG, "Not yet implemented request for namespace %u, neither internal nor in a plugin", (unsigned)namespaceId);
+                ESP_LOGW(TAG, "Not yet implemented request for namespace %u, neither internal nor in a plugin", (unsigned)header.namespaceId);
+                reply.Error(WsProtocol::ErrorCode::UnknownMessage, "unknown message");
             }
             else if (success == eMessageReceiverResult::FOR_ME_BUT_FAILED)
             {
-                ESP_LOGW(TAG, "Request for namespace %u has been implemented by plugin, but processing failed", (unsigned)namespaceId);
+                ESP_LOGW(TAG, "Request for namespace %u has been implemented by plugin, but processing failed", (unsigned)header.namespaceId);
+                if (!answered) reply.Error(WsProtocol::ErrorCode::Failed, "the request failed");
             }
             delete[] buf;
             return ESP_OK;
@@ -666,16 +676,21 @@ namespace webmanager
             uint8_t buf[512];
             size_t len = fread(buf, 1, sizeof(buf), f);
             fclose(f);
-            if (len < 4) return false;
-            uint16_t nsId = (uint16_t)(buf[0] | (buf[1] << 8));
-            uint16_t typeId = (uint16_t)(buf[2] | (buf[3] << 8));
-            if (nsId != WsProtocol::usermanagement::NAMESPACE_ID || typeId != WsProtocol::usermanagement::UserRecord::TYPE_ID)
+            WsProtocol::FrameHeader header{};
+            if (!WsProtocol::ReadHeader(buf, len, header) || header.namespaceId != WsProtocol::usermanagement::NAMESPACE_ID ||
+                header.messageTypeId != WsProtocol::usermanagement::UserRecord::TYPE_ID || header.flags != 0)
             {
                 ESP_LOGE(TAG, "load_user('%s'): unexpected file header, ignoring (corrupt or wrong schema version?)", username.c_str());
                 return false;
             }
             WsProtocol::usermanagement::UserRecord::Payload payload{};
-            if (!WsProtocol::usermanagement::UserRecord::Decode(buf, len, payload)) return false;
+            // a record that does not decode to its own name is unreadable (corrupt, or written with another
+            // frame format) - never a user, so it can neither log in nor count as the admin
+            if (!WsProtocol::usermanagement::UserRecord::Decode(buf, len, payload) || username != payload.username)
+            {
+                ESP_LOGE(TAG, "load_user('%s'): record unreadable, ignoring", username.c_str());
+                return false;
+            }
             out.username = payload.username;
             out.salt = payload.salt;
             out.passwordHash = payload.passwordHash;
@@ -732,22 +747,6 @@ namespace webmanager
             return result;
         }
 
-        bool user_store_is_empty()
-        {
-            DIR *dir = opendir("/spiffs/users");
-            if (!dir) return true;
-            struct dirent *entry;
-            bool empty = true;
-            while ((entry = readdir(dir)) != nullptr)
-            {
-                if (entry->d_type == DT_DIR) continue;
-                empty = false;
-                break;
-            }
-            closedir(dir);
-            return empty;
-        }
-
         int count_admins()
         {
             int count = 0;
@@ -759,10 +758,12 @@ namespace webmanager
             return count;
         }
 
-        void bootstrap_default_admin_if_user_store_empty()
+        // Also when the store holds only unreadable records (see load_user()): without a readable admin
+        // nobody could log in to repair it.
+        void bootstrap_default_admin_if_no_admin()
         {
-            if (!user_store_is_empty()) return;
-            ESP_LOGW(TAG, "No users found in user store -- creating default admin user '%s' from Begin()-parameters. Change this password after first login!", bootstrap_admin_username.c_str());
+            if (count_admins() > 0) return;
+            ESP_LOGW(TAG, "No readable admin in the user store -- creating default admin user '%s' from Begin()-parameters. Change this password after first login!", bootstrap_admin_username.c_str());
             StoredUser admin;
             admin.username = bootstrap_admin_username;
             admin.salt = generate_salt_hex();
@@ -1302,7 +1303,7 @@ namespace webmanager
             this->hostname = hostname;
             this->bootstrap_admin_username = auth_username_param;
             this->bootstrap_admin_password = auth_password_param;
-            bootstrap_default_admin_if_user_store_empty();
+            bootstrap_default_admin_if_no_admin();
 
             if (sessions_semaphore != nullptr)
             {
@@ -1410,9 +1411,38 @@ namespace webmanager
         // Erlaubt der konkreten Klasse, eigene Websocket-Namespaces zu bedienen, bevor der
         // generische Plugin-Dispatch greift (webmanager::M nutzt das fuer den
         // wifimanager-Namespace). Signatur identisch zu iWebmanagerPlugin::ProvideWebsocketMessage.
-        virtual eMessageReceiverResult ProvideWebsocketMessage(iWebmanagerCallback *callback, httpd_req_t *req, httpd_ws_frame_t *ws_pkt, uint16_t namespaceId, uint16_t messageTypeId, const uint8_t *frame, size_t frameLen)
+        virtual eMessageReceiverResult ProvideWebsocketMessage(iWebmanagerCallback *callback, WsProtocol::Responder &reply, const uint8_t *frame, size_t frameLen)
         {
             return eMessageReceiverResult::NOT_FOR_ME;
+        }
+
+        // The answer of a Responder: through SendRawAsync() (len 0: it did not fit the buffer).
+        static void send_answer(void *context, const uint8_t *data, size_t len)
+        {
+            auto *self = static_cast<aWebmanagerBase *>(context);
+            if (len == 0)
+            {
+                ESP_LOGE(TAG, "answer could not be encoded (buffer too small), the client gets none");
+                return;
+            }
+            self->answered = true;
+            self->SendRawAsync(data, len);
+        }
+
+        // A later answer (any task): like send_answer, but it does not touch 'answered' (the httpd task's).
+        static void send_later(void *context, const uint8_t *data, size_t len)
+        {
+            if (len == 0)
+            {
+                ESP_LOGE(TAG, "answer could not be encoded (buffer too small), the client gets none");
+                return;
+            }
+            static_cast<aWebmanagerBase *>(context)->SendRawAsync(data, len);
+        }
+
+        WsProtocol::Responder ResponderFor(const WsProtocol::FrameHeader &request, uint8_t *buffer, size_t size) override
+        {
+            return WsProtocol::Responder(request, buffer, size, send_later, this);
         }
 
         // --- Generische oeffentliche API ------------------------------------------------------
