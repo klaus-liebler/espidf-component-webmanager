@@ -54,6 +54,7 @@
 #include "webmanager_interfaces.hh"
 #include "webmanager_async_response.hh"
 #include "wsprotocol_cpp/ws_protocol.hh"
+#include "station_package.hh"
 
 namespace webmanager
 {
@@ -85,6 +86,15 @@ namespace webmanager
 
         httpd_handle_t http_server{nullptr};
         int websocket_file_descriptor{-1};
+
+        // Stationspaket (s. station_package.hh), nur aktiv nach EnableStationPackage().
+        bool stationPackageEnabled{false};
+        char stationNodeId[32]{};
+        uint8_t stationCompatId[32]{};
+        std::string stationDir;          // z. B. "/spiffs"
+        bool packagedWebUiActive{false}; // gueltiges Paket mit Web-UI vorhanden -> wird statt der eingebauten ausgeliefert
+        char webUiVersion[17]{"builtin"};  // erste 8 Byte des SHA-256 der Web-UI als Hex, sonst "builtin"
+        char webUiCookie[48]{};
         // Aktuell authentifizierter Nutzer der (einzigen) offenen Websocket-Verbindung -- fuer
         // rollenbasierte Autorisierung durch Plugins/Message-Handler (s. GetCurrentSessionRoles()).
         std::string current_ws_username{""};
@@ -340,6 +350,7 @@ namespace webmanager
         // Bootloader beim naechsten Neustart zur alten zurueck.
         esp_err_t handle_ota_post(httpd_req_t *req)
         {
+            if (!require_login(req)) return ESP_FAIL;
             ESP_LOGI(TAG, "in handle_ota_post, %u bytes", (unsigned)req->content_len);
             const esp_partition_t *ota_partition = esp_ota_get_next_update_partition(NULL);
             if (ota_partition == nullptr || req->content_len == 0)
@@ -458,6 +469,7 @@ namespace webmanager
 
         esp_err_t handle_files_get(httpd_req_t *req)
         {
+            if (!require_login(req)) return ESP_FAIL;
             FILE *fd = nullptr;
             struct stat file_stat;
 
@@ -516,6 +528,7 @@ namespace webmanager
 
         esp_err_t handle_files_post(httpd_req_t *req)
         {
+            if (!require_login(req)) return ESP_FAIL;
             FILE *fd = NULL;
             struct stat file_stat;
 
@@ -607,6 +620,7 @@ namespace webmanager
 
         esp_err_t handle_files_delete(httpd_req_t *req)
         {
+            if (!require_login(req)) return ESP_FAIL;
             struct stat file_stat;
             const char *path = req->uri + FILES_BASE_PATH_LEN;
             ESP_LOGI(TAG, "Got DELETE files for filename %s ", path);
@@ -947,6 +961,18 @@ namespace webmanager
             char cookie_buf[256] = {0};
             return httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK &&
                    validate_session_token(cookie_buf, outUsername, outRoles);
+        }
+
+        // Fuer HTTP-Endpunkte, die den Zustand des Geraets aendern oder Dateien liefern (OTA,
+        // /files, /package): ohne gueltige Session 401. Bei abgeschaltetem Login immer erlaubt.
+        bool require_login(httpd_req_t *req)
+        {
+            std::string username;
+            uint8_t roles = 0;
+            if (authenticate_request(req, username, roles)) return true;
+            ESP_LOGW(TAG, "Rejected %s %s: not logged in", req->method == HTTP_POST ? "POST" : "request", req->uri);
+            httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Login required");
+            return false;
         }
 
         bool validate_session_token(const char *cookie_header, std::string &outUsername, uint8_t &outRoles)
@@ -1290,16 +1316,267 @@ namespace webmanager
             return ESP_OK;
         }
 
+        // Liefert die Web-UI aus: die aus dem Stationspaket, falls aktiv, sonst die in die Firmware
+        // eingebaute. Das Cookie "webui" sagt der Seite, welche Version sie ist; nach dem
+        // (Wieder-)Verbinden vergleicht sie es mit GET /webui/version und laedt sich bei Abweichung neu.
+        esp_err_t send_webui(httpd_req_t *req)
+        {
+            snprintf(webUiCookie, sizeof(webUiCookie), "webui=%s; Path=/; SameSite=Strict", webUiVersion);
+            httpd_resp_set_hdr(req, "Set-Cookie", webUiCookie);
+            httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+            httpd_resp_set_type(req, "text/html");
+            httpd_resp_set_hdr(req, "Content-Encoding", "br");
+            if (packagedWebUiActive)
+            {
+                std::string path = stationDir + "/webui.br";
+                FILE *fd = fopen(path.c_str(), "r");
+                if (fd)
+                {
+                    size_t n;
+                    while ((n = fread(http_buffer, 1, HTTP_BUFFER_SIZE, fd)) > 0)
+                    {
+                        if (httpd_resp_send_chunk(req, (const char *)http_buffer, n) != ESP_OK)
+                        {
+                            fclose(fd);
+                            return ESP_FAIL;
+                        }
+                    }
+                    fclose(fd);
+                    return httpd_resp_send_chunk(req, nullptr, 0);
+                }
+                ESP_LOGE(TAG, "%s not readable, falling back to built-in web UI", path.c_str());
+                packagedWebUiActive = false;
+                strcpy(webUiVersion, "builtin");
+            }
+            return httpd_resp_send(req, webmanager_html_br_start, webmanager_html_br_length);
+        }
+
+        esp_err_t handle_webui_version_get(httpd_req_t *req)
+        {
+            httpd_resp_set_type(req, "text/plain");
+            httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+            return httpd_resp_sendstr(req, webUiVersion);
+        }
+
+        static void hex_of(const uint8_t *bytes, size_t n, char *out)
+        {
+            static const char *digits = "0123456789abcdef";
+            for (size_t i = 0; i < n; i++)
+            {
+                out[2 * i] = digits[bytes[i] >> 4];
+                out[2 * i + 1] = digits[bytes[i] & 0x0F];
+            }
+            out[2 * n] = 0;
+        }
+
+        // SHA-256 ueber einen Bereich einer offenen Datei
+        bool sha256_of_file_range(FILE *fd, uint32_t offset, uint32_t size, uint8_t out[32])
+        {
+            if (fseek(fd, offset, SEEK_SET) != 0) return false;
+            mbedtls_md_context_t ctx;
+            mbedtls_md_init(&ctx);
+            bool ok = mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0) == 0 && mbedtls_md_starts(&ctx) == 0;
+            while (ok && size > 0)
+            {
+                size_t n = fread(http_buffer, 1, std::min<size_t>(size, HTTP_BUFFER_SIZE), fd);
+                if (n == 0) { ok = false; break; }
+                ok = mbedtls_md_update(&ctx, http_buffer, n) == 0;
+                size -= n;
+            }
+            ok = ok && mbedtls_md_finish(&ctx, out) == 0;
+            mbedtls_md_free(&ctx);
+            return ok;
+        }
+
+        // Liest und prueft ein Paket. Bei Erfolg: Kopf und Abschnitt der Web-UI.
+        station_package::CheckResult read_package(const char *path, station_package::PackageHeader &h, station_package::PackageSection &webui, bool verifyChecksums)
+        {
+            using namespace station_package;
+            struct stat st;
+            if (stat(path, &st) != 0) return CheckResult::BAD_LAYOUT;
+            FILE *fd = fopen(path, "r");
+            if (!fd) return CheckResult::BAD_LAYOUT;
+            PackageSection sections[MAX_SECTIONS];
+            CheckResult r = CheckResult::BAD_LAYOUT;
+            if (fread(&h, 1, sizeof(h), fd) == sizeof(h) && memcmp(h.magic, MAGIC, sizeof(MAGIC)) == 0 && h.sectionCount <= MAX_SECTIONS &&
+                fread(sections, sizeof(PackageSection), h.sectionCount, fd) == h.sectionCount)
+            {
+                r = CheckHeader(h, sections, (uint32_t)st.st_size, stationNodeId, stationCompatId);
+            }
+            else if (memcmp(h.magic, MAGIC, sizeof(MAGIC)) != 0)
+            {
+                r = CheckResult::BAD_MAGIC;
+            }
+            bool foundWebUi = false;
+            for (uint16_t i = 0; r == CheckResult::OK && i < h.sectionCount; i++)
+            {
+                if (verifyChecksums)
+                {
+                    uint8_t sha[32];
+                    if (!sha256_of_file_range(fd, sections[i].offset, sections[i].size, sha) || memcmp(sha, sections[i].sha256, 32) != 0)
+                    {
+                        ESP_LOGE(TAG, "Package section %u: checksum mismatch", i);
+                        r = CheckResult::BAD_LAYOUT;
+                    }
+                }
+                if (sections[i].type == (uint16_t)SectionType::WEBUI_HTML_BR)
+                {
+                    webui = sections[i];
+                    foundWebUi = true;
+                }
+            }
+            fclose(fd);
+            if (r == CheckResult::OK && !foundWebUi) r = CheckResult::BAD_LAYOUT;
+            return r;
+        }
+
+        bool copy_file_range(const char *src, uint32_t offset, uint32_t size, const char *dst)
+        {
+            FILE *in = fopen(src, "r");
+            if (!in) return false;
+            FILE *out = fopen(dst, "w");
+            bool ok = out != nullptr && fseek(in, offset, SEEK_SET) == 0;
+            while (ok && size > 0)
+            {
+                size_t n = fread(http_buffer, 1, std::min<size_t>(size, HTTP_BUFFER_SIZE), in);
+                ok = n > 0 && fwrite(http_buffer, 1, n, out) == n;
+                size -= n;
+            }
+            if (out) fclose(out);
+            fclose(in);
+            if (!ok) unlink(dst);
+            return ok;
+        }
+
+        // Setzt die Version der (bereits nach webui.br kopierten) Web-UI aus dem Paket und schaltet auf sie um.
+        void activate_webui(const station_package::PackageSection &webui)
+        {
+            char hex[65];
+            hex_of(webui.sha256, 8, hex);
+            strcpy(webUiVersion, hex);
+            packagedWebUiActive = true;
+        }
+
+        esp_err_t handle_package_post(httpd_req_t *req)
+        {
+            using namespace station_package;
+            if (!require_login(req)) return ESP_FAIL;
+            constexpr size_t MAX_PACKAGE_SIZE = 512 * 1024;
+            if (req->content_len < sizeof(PackageHeader) || req->content_len > MAX_PACKAGE_SIZE)
+            {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Package size invalid");
+                return ESP_FAIL;
+            }
+            std::string tmp = stationDir + "/package.tmp";
+            FILE *fd = fopen(tmp.c_str(), "w");
+            if (!fd)
+            {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot write to storage");
+                return ESP_FAIL;
+            }
+            size_t remaining = req->content_len;
+            int timeouts = 0;
+            while (remaining > 0)
+            {
+                int n = httpd_req_recv(req, (char *)http_buffer, std::min(remaining, HTTP_BUFFER_SIZE));
+                if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= 5) continue;
+                if (n <= 0 || fwrite(http_buffer, 1, n, fd) != (size_t)n)
+                {
+                    fclose(fd);
+                    unlink(tmp.c_str());
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Package reception failed");
+                    return ESP_FAIL;
+                }
+                remaining -= n;
+            }
+            fclose(fd);
+
+            PackageHeader h{};
+            PackageSection webui{};
+            CheckResult r = read_package(tmp.c_str(), h, webui, true);
+            if (r != CheckResult::OK)
+            {
+                unlink(tmp.c_str());
+                ESP_LOGW(TAG, "Package rejected: %s", ToString(r));
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, ToString(r));
+                return ESP_FAIL;
+            }
+            // Erst die neue Web-UI vollstaendig schreiben, dann umschalten: ein Abbruch laesst das alte Paket aktiv
+            std::string webuiTmp = stationDir + "/webui.tmp", webuiPath = stationDir + "/webui.br", pkgPath = stationDir + "/station.pkg";
+            if (!copy_file_range(tmp.c_str(), webui.offset, webui.size, webuiTmp.c_str()))
+            {
+                unlink(tmp.c_str());
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot store web UI");
+                return ESP_FAIL;
+            }
+            packagedWebUiActive = false; // waehrend des Umbenennens die eingebaute ausliefern
+            unlink(webuiPath.c_str());
+            unlink(pkgPath.c_str());
+            if (rename(webuiTmp.c_str(), webuiPath.c_str()) != 0 || rename(tmp.c_str(), pkgPath.c_str()) != 0)
+            {
+                strcpy(webUiVersion, "builtin");
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot activate package");
+                return ESP_FAIL;
+            }
+            activate_webui(webui);
+            char label[sizeof(h.label) + 1]{};
+            memcpy(label, h.label, sizeof(h.label));
+            ESP_LOGI(TAG, "Station package activated: %s, web UI %s", label, webUiVersion);
+            char answer[128];
+            snprintf(answer, sizeof(answer), "Stationspaket aktiv: %s (Web-UI %s)", label, webUiVersion);
+            httpd_resp_sendstr(req, answer);
+            // Offene Seite trennen: sie verbindet sich neu, vergleicht die Version und laedt sich neu
+            close_active_websocket_before_ap_shutdown();
+            return ESP_OK;
+        }
+
+    public:
+        // Schaltet das Stationspaket ein (s. station_package.hh). Vor RegisterHTTPDHandlers aufrufen.
+        // compatIdHex: 64 Hex-Zeichen (STATION_COMPAT_ID der Firmware). dir: Verzeichnis eines
+        // eingehaengten Dateisystems (z. B. "/spiffs"). Ein vorhandenes Paket, das nicht (mehr) zur
+        // Firmware passt (z. B. nach einem OTA-Update mit anderem Hausmodell), wird verworfen -- dann
+        // gilt die eingebaute Web-UI.
+        esp_err_t EnableStationPackage(const char *nodeId, const char *compatIdHex, const char *dir)
+        {
+            if (!station_package::ParseHex32(compatIdHex, stationCompatId))
+            {
+                ESP_LOGE(TAG, "EnableStationPackage: invalid compat id");
+                return ESP_ERR_INVALID_ARG;
+            }
+            strlcpy(stationNodeId, nodeId, sizeof(stationNodeId));
+            stationDir = dir;
+            stationPackageEnabled = true;
+
+            std::string pkgPath = stationDir + "/station.pkg", webuiPath = stationDir + "/webui.br";
+            station_package::PackageHeader h{};
+            station_package::PackageSection webui{};
+            struct stat st;
+            auto r = read_package(pkgPath.c_str(), h, webui, false);
+            if (r == station_package::CheckResult::OK && stat(webuiPath.c_str(), &st) == 0 && (uint32_t)st.st_size == webui.size)
+            {
+                activate_webui(webui);
+                ESP_LOGI(TAG, "Station package found, serving packaged web UI %s", webUiVersion);
+            }
+            else
+            {
+                if (stat(pkgPath.c_str(), &st) == 0)
+                {
+                    ESP_LOGW(TAG, "Station package discarded (%s), serving built-in web UI", station_package::ToString(r));
+                    unlink(pkgPath.c_str());
+                }
+                unlink(webuiPath.c_str());
+            }
+            return ESP_OK;
+        }
+
+    protected:
         esp_err_t handle_webmanager_get(httpd_req_t *req)
         {
             if (authenticationDisabled)
             {
                 // Kein Login: SPA direkt ausliefern; das (nicht-HttpOnly) username-Cookie zeigt die UI im Kopf an.
                 httpd_resp_set_hdr(req, "Set-Cookie", "username=anonymous; Path=/; Secure; SameSite=Strict");
-                httpd_resp_set_type(req, "text/html");
-                httpd_resp_set_hdr(req, "Content-Encoding", "br");
-                httpd_resp_send(req, webmanager_html_br_start, webmanager_html_br_length);
-                return ESP_OK;
+                return send_webui(req);
             }
             // Check for valid session cookie
             char cookie_buf[256] = {0};
@@ -1318,10 +1595,7 @@ namespace webmanager
                     char session_cookie_buf[160];
                     char username_cookie_buf[160];
                     set_session_cookies(req, token_buf, username, session_cookie_buf, username_cookie_buf);
-                    httpd_resp_set_type(req, "text/html");
-                    httpd_resp_set_hdr(req, "Content-Encoding", "br");
-                    httpd_resp_send(req, webmanager_html_br_start, webmanager_html_br_length);
-                    return ESP_OK;
+                    return send_webui(req);
                 }
             }
 
@@ -1603,6 +1877,22 @@ namespace webmanager
                 { return static_cast<webmanager::aWebmanagerBase *>(req->user_ctx)->handle_webmanager_ws(req); }, this, true, false, nullptr};
             ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &webmanager_ws));
             
+            if (stationPackageEnabled)
+            {
+                httpd_uri_t package_post = {
+                    "/package", HTTP_POST,
+                    [](httpd_req_t *req)
+                    { return static_cast<aWebmanagerBase *>(req->user_ctx)->handle_package_post(req); },
+                    this, false, false, nullptr};
+                ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &package_post));
+            }
+            httpd_uri_t webui_version_get = {
+                "/webui/version", HTTP_GET,
+                [](httpd_req_t *req)
+                { return static_cast<aWebmanagerBase *>(req->user_ctx)->handle_webui_version_get(req); },
+                this, false, false, nullptr};
+            ESP_ERROR_CHECK(httpd_register_uri_handler(httpd_handle, &webui_version_get));
+
             httpd_uri_t webmanager_get = {
                 "/*", HTTP_GET,
                 [](httpd_req_t *req)
