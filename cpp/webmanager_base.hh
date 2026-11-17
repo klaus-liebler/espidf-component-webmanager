@@ -1522,9 +1522,25 @@ namespace webmanager
             char label[sizeof(h.label) + 1]{};
             memcpy(label, h.label, sizeof(h.label));
             ESP_LOGI(TAG, "Station package activated: %s, web UI %s", label, webUiVersion);
-            char answer[128];
-            snprintf(answer, sizeof(answer), "Stationspaket aktiv: %s (Web-UI %s)", label, webUiVersion);
+            // Enthaelt das Paket mehr als die Web-UI (Stationskonfiguration), wertet die Anwendung das
+            // beim Start aus -> Neustart. Sonst genuegt es, die Seite neu zu laden.
+            const bool restart = h.sectionCount > 1;
+            char answer[160];
+            snprintf(answer, sizeof(answer), "Stationspaket aktiv: %s (Web-UI %s)%s", label, webUiVersion, restart ? " - Neustart (restarting)" : "");
             httpd_resp_sendstr(req, answer);
+            if (restart)
+            {
+                static esp_timer_handle_t restartTimer{nullptr};
+                if (!restartTimer)
+                {
+                    esp_timer_create_args_t args{};
+                    args.callback = [](void *) { esp_restart(); };
+                    args.name = "pkg_restart";
+                    esp_timer_create(&args, &restartTimer);
+                }
+                esp_timer_start_once(restartTimer, 1500 * 1000);
+                return ESP_OK;
+            }
             // Offene Seite trennen: sie verbindet sich neu, vergleicht die Version und laedt sich neu
             close_active_websocket_before_ap_shutdown();
             return ESP_OK;

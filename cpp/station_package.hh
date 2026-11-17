@@ -15,6 +15,11 @@
 // eingebaut). Pakete mit anderem Modell/Protokoll werden abgelehnt.
 #include <cstdint>
 #include <cstring>
+#ifdef ESP_PLATFORM
+#include <cstdio>
+#include <vector>
+#include <mbedtls/md.h>
+#endif
 
 namespace webmanager::station_package
 {
@@ -24,8 +29,8 @@ namespace webmanager::station_package
 
     enum class SectionType : uint16_t
     {
-        WEBUI_HTML_BR = 1, // komplette Web-UI (index.html, brotli-komprimiert)
-        // HARDWARE_CONFIG = 2, APP_CONFIG = 3: kommen mit der datengetriebenen Basis
+        WEBUI_HTML_BR = 1,  // komplette Web-UI (index.html, brotli-komprimiert)
+        STATION_CONFIG = 2, // Konfiguration der Station (Busse, Apps), Format legt die Anwendung fest (sensact: sensactcfg::StationConfig)
     };
 
 #pragma pack(push, 1)
@@ -96,6 +101,54 @@ namespace webmanager::station_package
         if (memcmp(h.compatId, expectedCompatId, sizeof(h.compatId)) != 0) return CheckResult::WRONG_COMPAT;
         return CheckResult::OK;
     }
+
+inline bool ParseHex32(const char *hex, uint8_t out[32]);
+
+#ifdef ESP_PLATFORM
+    // Liest den Abschnitt einer Art aus einer Paketdatei, nachdem Kopf, Station, Kennung und die
+    // Pruefsumme des Abschnitts kontrolliert wurden. Fuer den Start der Anwendung (z. B. sensact laedt
+    // die Stationskonfiguration, bevor der Webmanager laeuft).
+    inline CheckResult ReadSection(const char *path, const char *expectedNodeId, const char *compatIdHex, SectionType type, std::vector<uint8_t> &out, bool &found)
+    {
+        found = false;
+        uint8_t compat[32];
+        if (!ParseHex32(compatIdHex, compat)) return CheckResult::BAD_LAYOUT;
+        FILE *fd = fopen(path, "r");
+        if (!fd) return CheckResult::BAD_LAYOUT;
+        fseek(fd, 0, SEEK_END);
+        long fileSize = ftell(fd);
+        fseek(fd, 0, SEEK_SET);
+        PackageHeader h{};
+        PackageSection sections[MAX_SECTIONS];
+        CheckResult r = CheckResult::BAD_LAYOUT;
+        if (fileSize > 0 && fread(&h, 1, sizeof(h), fd) == sizeof(h) && h.sectionCount <= MAX_SECTIONS &&
+            fread(sections, sizeof(PackageSection), h.sectionCount, fd) == h.sectionCount)
+        {
+            r = CheckHeader(h, sections, (uint32_t)fileSize, expectedNodeId, compat);
+        }
+        for (uint16_t i = 0; r == CheckResult::OK && i < h.sectionCount && !found; i++)
+        {
+            if (sections[i].type != (uint16_t)type) continue;
+            out.resize(sections[i].size);
+            if (fseek(fd, sections[i].offset, SEEK_SET) != 0 || fread(out.data(), 1, out.size(), fd) != out.size())
+            {
+                r = CheckResult::BAD_LAYOUT;
+                break;
+            }
+            uint8_t sha[32];
+            if (mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), out.data(), out.size(), sha) != 0) { r = CheckResult::BAD_LAYOUT; break; }
+            if (memcmp(sha, sections[i].sha256, 32) != 0)
+            {
+                r = CheckResult::BAD_LAYOUT;
+                break;
+            }
+            found = true;
+        }
+        fclose(fd);
+        if (!found) out.clear();
+        return r;
+    }
+#endif
 
     // "0a1b..." (64 Hex-Zeichen) -> 32 Byte; false bei ungueltiger Eingabe
     inline bool ParseHex32(const char *hex, uint8_t out[32])
