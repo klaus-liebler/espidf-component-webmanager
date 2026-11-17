@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <memory>
 #include <map>
+#include <string>
+#include <vector>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
@@ -70,6 +72,10 @@ namespace scheduler
             name2timer[DAILY_6_22.GetName()] = &DAILY_6_22;
             name2timer[WORKING_DAYS_7_18.GetName()] = &WORKING_DAYS_7_18;
             name2timer[TestEvenMinutesOnOddMinutesOff.GetName()] = &TestEvenMinutesOnOddMinutesOff;
+            // Eintraege, die sich nicht (mehr) lesen lassen -- z.B. aus der Zeit vor dem
+            // BestBinaryBuffers-Laengenpraefix (2026-11-17) --, werden nach dem Durchlauf geloescht,
+            // statt dauerhaft NVS zu belegen. Die Zeitplaene muessen dann neu angelegt werden.
+            std::vector<std::string> unreadable;
             nvs_iterator_t it = nullptr;
             esp_err_t res = nvs_entry_find_in_handle(this->nvsSchedulerHandle, NVS_TYPE_BLOB, &it);
             while (res == ESP_OK)
@@ -82,29 +88,49 @@ namespace scheduler
                 nvs_get_blob(this->nvsSchedulerHandle, info.key, data, &length);
                 WsProtocol::scheduler::Schedule::Payload schedule{};
                 size_t pos = 0;
-                if (WsProtocol::scheduler::Schedule::Decode(data, length, pos, schedule))
+                aTimer *t = WsProtocol::scheduler::Schedule::Decode(data, length, pos, schedule) ? Builder::BuildFromSchedule(schedule) : nullptr;
+                if (t)
                 {
-                    aTimer *t = Builder::BuildFromSchedule(schedule);
-                    if (t) this->name2timer[t->GetName()] = t;
+                    this->name2timer[t->GetName()] = t;
+                }
+                else
+                {
+                    unreadable.emplace_back(info.key);
                 }
                 res = nvs_entry_next(&it);
             }
             nvs_release_iterator(it);
+            for (const auto &key : unreadable)
+            {
+                ESP_LOGW(TAG, "schedule '%s' in NVS is unreadable (old format?) -- erased, please create it again", key.c_str());
+                nvs_erase_key(this->nvsSchedulerHandle, key.c_str());
+            }
+            if (!unreadable.empty())
+            {
+                nvs_commit(this->nvsSchedulerHandle);
+            }
         }
 
         esp_err_t Loop(time_t unixSecs)
         {
 
-            uint32_t newJulianDay = sunsetsunrise::JulianDate(unixSecs);
-            if (newJulianDay == this->julianDay)
+            // Tageswechsel an der UTC-Mitternacht. (Vorher: float-JulianDate -- ungenau und mit
+            // Wechsel um 12:00 UTC -- und an NextSunriseAndSunset wurde die Tageszahl statt der
+            // Unix-Zeit und Grad statt Bogenmass uebergeben: berechnet wurde ein Tag im Jan. 1970.)
+            const uint32_t newDay = (uint32_t)(unixSecs / sunsetsunrise::ONE_DAY);
+            if (newDay == this->julianDay)
                 return ESP_OK;
-            this->julianDay = newJulianDay;
-            double latDeg = 52.0965;
-            double lonDeg = 7.6171;
+            this->julianDay = newDay;
+            // TODO: Standort konfigurierbar machen (derzeit fest: Greven)
+            constexpr double latDeg = 52.0965;
+            constexpr double lonDeg = 7.6171;
             time_t sunriseUnixSecs{0};
             time_t sunsetUnixSecs{0};
-            sunsetsunrise::NextSunriseAndSunset<double>(this->julianDay, latDeg, lonDeg, sunsetsunrise::eDawn::CIVIL, sunriseUnixSecs, sunsetUnixSecs);
-            ESP_LOGI(TAG, "A new julian day %lu has begun. sunrise %lld, sunset %lld", julianDay, sunriseUnixSecs, sunsetUnixSecs);
+            if (!sunsetsunrise::SunriseAndSunsetOfDay<double>(unixSecs, latDeg * sunsetsunrise::DEG, lonDeg * sunsetsunrise::DEG, sunsetsunrise::eDawn::CIVIL, sunriseUnixSecs, sunsetUnixSecs))
+            {
+                ESP_LOGW(TAG, "no sunrise/sunset today");
+            }
+            ESP_LOGI(TAG, "A new day %lu has begun. sunrise %lld, sunset %lld", (unsigned long)julianDay, (long long)sunriseUnixSecs, (long long)sunsetUnixSecs);
             for (auto const &[key, val] : name2timer)
             {
                 val->NewDayHasBegun(julianDay, sunriseUnixSecs, sunsetUnixSecs);

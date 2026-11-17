@@ -7,6 +7,7 @@
 #include <type_traits>
 #include "wsprotocol_cpp/ws_protocol.hh"
 #include "esp_random.h"
+#include <common.hh>
 #include "sunsetsunrise.hh"
 #define TAG "SCHEDULER"
 #include "esp_log.h"
