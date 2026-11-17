@@ -12,6 +12,7 @@
 #include <freertos/queue.h>
 #include <freertos/timers.h>
 #include <esp_ota_ops.h>
+#include <esp_app_desc.h>
 #include <esp_partition.h>
 #include <esp_timer.h>
 #include <esp_chip_info.h>
@@ -331,52 +332,89 @@ namespace webmanager
             return ESP_OK;
         }
 
+        // Firmware-Upload (OTA). Fehler fuehren zu einer HTTP-Fehlerantwort, nie zu einem Neustart
+        // mitten im Upload; ein abgebrochener Upload gibt seine Ressourcen frei (esp_ota_abort). Ein
+        // Image eines anderen Projekts (esp_app_desc_t::project_name) wird nicht aktiviert. Mit
+        // CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE startet die neue Firmware "auf Probe" und muss sich per
+        // CallMeAfterInitializationToMarkCurrentPartitionAsValid() bestaetigen, sonst kehrt der
+        // Bootloader beim naechsten Neustart zur alten zurueck.
         esp_err_t handle_ota_post(httpd_req_t *req)
         {
-            ESP_LOGI(TAG, "in handle_ota_post");
-            char buf[1024];
-            esp_ota_handle_t ota_handle;
-            size_t remaining = req->content_len;
-
+            ESP_LOGI(TAG, "in handle_ota_post, %u bytes", (unsigned)req->content_len);
             const esp_partition_t *ota_partition = esp_ota_get_next_update_partition(NULL);
-            ESP_ERROR_CHECK(esp_ota_begin(ota_partition, OTA_SIZE_UNKNOWN, &ota_handle));
-
-            while (remaining > 0)
+            if (ota_partition == nullptr || req->content_len == 0)
             {
-                int recv_len = httpd_req_recv(req, buf, std::min(remaining, (size_t)sizeof(buf)));
-                if (recv_len <= 0)
-                {
-                    // Serious Error: Abort OTA
-                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Protocol Error");
-                    return ESP_FAIL;
-                }
-                if (recv_len == HTTPD_SOCK_ERR_TIMEOUT)
-                {
-                    // Timeout Error: Just retry
-                    continue;
-                }
-                if (esp_ota_write(ota_handle, (const void *)buf, recv_len) != ESP_OK)
-                {
-                    // Successful Upload: Flash firmware chunk
-                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash Error");
-                    return ESP_FAIL;
-                }
-
-                remaining -= recv_len;
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, ota_partition == nullptr ? "No OTA partition" : "Empty upload");
+                return ESP_FAIL;
             }
-
-            // Validate and switch to new OTA image and reboot
-            if (esp_ota_end(ota_handle) != ESP_OK || esp_ota_set_boot_partition(ota_partition) != ESP_OK)
+            esp_ota_handle_t ota_handle;
+            esp_err_t err = esp_ota_begin(ota_partition, OTA_SIZE_UNKNOWN, &ota_handle);
+            if (err != ESP_OK)
             {
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Validation / Activation Error");
+                ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
                 return ESP_FAIL;
             }
 
-            httpd_resp_sendstr(req, "Firmware update complete, rebooting now!\n");
+            char buf[1024];
+            size_t remaining = req->content_len;
+            int timeouts = 0;
+            constexpr int MAX_TIMEOUTS = 5;
+            while (remaining > 0)
+            {
+                const int recv_len = httpd_req_recv(req, buf, std::min(remaining, sizeof(buf)));
+                if (recv_len == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= MAX_TIMEOUTS)
+                {
+                    continue; // Timeout: erneut versuchen
+                }
+                if (recv_len <= 0)
+                {
+                    ESP_LOGE(TAG, "OTA upload: receive failed (%d)", recv_len);
+                    esp_ota_abort(ota_handle);
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive error");
+                    return ESP_FAIL;
+                }
+                timeouts = 0;
+                err = esp_ota_write(ota_handle, buf, recv_len);
+                if (err != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+                    esp_ota_abort(ota_handle);
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash write error");
+                    return ESP_FAIL;
+                }
+                remaining -= recv_len;
+            }
 
+            // esp_ota_end gibt das Handle in jedem Fall frei (auch bei Fehler) und prueft das Image
+            err = esp_ota_end(ota_handle);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err == ESP_ERR_OTA_VALIDATE_FAILED ? "Image invalid" : "OTA end failed");
+                return ESP_FAIL;
+            }
+            esp_app_desc_t newDesc{};
+            const esp_app_desc_t *runningDesc = esp_app_get_description();
+            if (esp_ota_get_partition_description(ota_partition, &newDesc) != ESP_OK ||
+                strncmp(newDesc.project_name, runningDesc->project_name, sizeof(newDesc.project_name)) != 0)
+            {
+                ESP_LOGE(TAG, "OTA image is for project '%s', running '%s' -- not activated", newDesc.project_name, runningDesc->project_name);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Image is for another project");
+                return ESP_FAIL;
+            }
+            err = esp_ota_set_boot_partition(ota_partition);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Activation error");
+                return ESP_FAIL;
+            }
+
+            ESP_LOGI(TAG, "OTA: '%s' version '%s' written, rebooting", newDesc.project_name, newDesc.version);
+            httpd_resp_sendstr(req, "Firmware update complete, rebooting now!\n");
             vTaskDelay(500 / portTICK_PERIOD_MS);
             esp_restart();
-
             return ESP_OK;
         }
 
