@@ -9,6 +9,21 @@
 * Stored Journal
 * Integrates with my home automation solution "sensact"
 
+## Plugins (opt-in)
+
+Plugins implement `webmanager::iWebmanagerPlugin` and are passed to `Begin()` in the plugin vector.
+Ready-made ones in `cpp/webmanager_plugins/`:
+
+* `SystemInfoPlugin` (namespace `systeminfo`): partitions, chip, MACs, restart.
+* `UsersettingsPlugin` (namespace `usersettings`).
+* `FirmwareLogPlugin` (namespace `firmwarelog`, schema `best_binary_buffers_schema/firmwarelog.cs`): the
+  ESP-IDF log (ESP_LOGx) in the browser. Create it as early as possible in `app_main` so that it buffers the
+  boot messages too (`new FirmwareLogPlugin(capacity)`, about 225 bytes per line, in PSRAM if available).
+  A hook on `esp_log_set_vprintf` passes every line on to the previous output (UART) unchanged and stores it
+  parsed (level, tag, text) in a ring buffer; an own task sends after the browser asked for the history
+  (`RequestLogHistory`), first the buffer, then every new line. `RequestSetLogLevel` calls
+  `esp_log_level_set`. In the web UI: `AppController.AddTerminal()` of `@klaus-liebler/web-components`.
+
 ## Features (Library User)
 
 * vite-based build process
